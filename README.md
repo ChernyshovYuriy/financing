@@ -1,2 +1,2 @@
-# financing
-All about financing as open as I can do.
+# Financing
+All about financing, as open as I can do.
