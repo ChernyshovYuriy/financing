@@ -199,6 +199,8 @@ This repo is intended to be a shared hub for finance-related tooling.
 
 - Point & Figure System: `https://github.com/ChernyshovYuriy/pfsystem`
 
+- TSX Canadian Stock Screener: `https://github.com/ChernyshovYuriy/stock-scanner`
+
 ---
 
 ## License
