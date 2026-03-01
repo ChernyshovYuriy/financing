@@ -507,10 +507,22 @@ def _process_symbol(sym: str, sub: pd.DataFrame,
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Canadian universe builder for swing trading")
+    parser.add_argument(
+        "--out",
+        type=str,
+        help="Path to output file",
+        default="out/can_tickers_swing"
+    )
+
+    args = parser.parse_args()
+
     config = UniverseBuilderConfig(
         tickers_path="data/can_tickers",
         benchmark="XIU.TO",
-        out_file_path="out/can_tickers_swing",
+        out_file_path=args.out,
         out_one_line_file_path="out/can_tickers_swing_one_line",
         out_rejected_file_path="out/can_tickers_rejected.csv",
         period="1y",
