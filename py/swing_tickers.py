@@ -505,11 +505,11 @@ def _process_symbol(sym: str, sub: pd.DataFrame,
 
 if __name__ == "__main__":
     config = UniverseBuilderConfig(
-        tickers_path="../data/can_tickers",
+        tickers_path="data/can_tickers",
         benchmark="XIU.TO",
-        out_file_path="../out/can_tickers_swing",
-        out_one_line_file_path="../out/can_tickers_swing_one_line",
-        out_rejected_file_path="../out/can_tickers_rejected.csv",
+        out_file_path="out/can_tickers_swing",
+        out_one_line_file_path="out/can_tickers_swing_one_line",
+        out_rejected_file_path="out/can_tickers_rejected.csv",
         period="1y",
         interval="1d",
         auto_adjust=True,
