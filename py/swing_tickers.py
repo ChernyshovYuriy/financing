@@ -24,6 +24,7 @@ Run from IDE:
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -442,7 +443,9 @@ def run_universe_builder(cfg: UniverseBuilderConfig) -> Tuple[pd.DataFrame, pd.D
     out_one_line = f"{cfg.out_one_line_file_path}"
     out_rejected = f"{cfg.out_rejected_file_path}"
 
-    with open(out_txt, "w", encoding="utf-8") as f:
+    out_file = Path(out_txt)  # no extension, ok
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_file.open("w", encoding="utf-8") as f:
         for sym in df_tradable["symbol"].tolist():
             f.write(sym + "\n")
 
