@@ -192,11 +192,11 @@ Tip: when tuning thresholds, the rejected CSV is the fastest way to see *why* na
 
 This repo is intended to be a shared hub for finance-related tooling.
 
-- Stage Radar: `https://github.com/ChernyshovYuriy/stage-radar`
+- Stage Radar: [https://github.com/ChernyshovYuriy/stage-radar](https://github.com/ChernyshovYuriy/stage-radar)
 
-- Point & Figure System: `https://github.com/ChernyshovYuriy/pfsystem`
+- Point & Figure System: [https://github.com/ChernyshovYuriy/pfsystem](https://github.com/ChernyshovYuriy/pfsystem)
 
-- TSX Canadian Stock Screener: `https://github.com/ChernyshovYuriy/stock-scanner`
+- TSX Canadian Stock Screener: [https://github.com/ChernyshovYuriy/stock-scanner](https://github.com/ChernyshovYuriy/stock-scanner)
 
 ---
 
