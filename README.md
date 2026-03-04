@@ -35,7 +35,6 @@ Install:
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # (Linux/macOS)
-# .venv\Scripts\activate    # (Windows PowerShell)
 
 pip install -r requirements.txt
 ```
@@ -73,13 +72,11 @@ Repo already includes a universe file at:
 
 ## How to run
 
-### Option A — run as-is (matches current `__main__` config)
+### Option A — run as-is
 
-The script’s `__main__` block uses relative paths like `../data/can_tickers`, so run it **from inside `py/`**.
+Run it **from root**.
 
 ```bash
-cd py
-mkdir -p ../out
 python swing_tickers.py
 ```
 
