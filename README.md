@@ -65,7 +65,7 @@ CVE.TO
 SHOP.TO
 ```
 
-Your repo already includes a universe file at:
+Repo already includes a universe file at:
 
 - `data/can_tickers`
 
@@ -73,7 +73,7 @@ Your repo already includes a universe file at:
 
 ## How to run
 
-### Option A — run as-is (matches your current `__main__` config)
+### Option A — run as-is (matches current `__main__` config)
 
 The script’s `__main__` block uses relative paths like `../data/can_tickers`, so run it **from inside `py/`**.
 
