@@ -16,6 +16,7 @@ Right now, the main utility here is **Swing Tickers (Universe Builder)**: it tak
 │  └─ can_tickers                 # one ticker per line (Yahoo format: .TO/.V/.CN/...)
 ├─ py/
 │  └─ swing_tickers.py            # universe builder / screener
+│  └─ tickers_info.py             # ticker metadata/market info builder
 ├─ requirements.txt
 └─ README.md
 ```
@@ -121,6 +122,45 @@ cfg = UniverseBuilderConfig(
 df_tradable, df_rejected = run_universe_builder(cfg)
 print(df_tradable.head())
 ```
+
+---
+
+## Tickers Info Builder
+
+### What it does
+
+Given a text file of tickers (one per line), it fetches metadata from Yahoo Finance and writes a CSV with:
+
+- `ticker`
+- `exchange`
+- `company_name`
+- `aliases` (ticker without exchange suffix, e.g. `RY.TO -> RY`)
+- `sector`
+- `average_volume`
+- `market_cap`
+- `last_price`
+- `spread_estimate`
+
+`spread_estimate` is computed as `ask - bid` when both are available; otherwise it falls back to `fallback_spread_pct * last_price` (default: `1%`).
+
+### How to run
+
+Run it from repo root:
+
+```bash
+python py/tickers_info.py --input data/can_tickers --out out/can_tickers_info.csv
+```
+
+Optional arguments:
+
+- `--fallback-spread-pct` (default `0.01`)
+- `--batch-size` (default `80`)
+- `--sleep` (default `1.0` seconds)
+
+### Output
+
+- **`out/can_tickers_info.csv`**
+  - one row per ticker with metadata + liquidity-related fields
 
 ---
 
