@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,8 @@ from typing import Optional
 
 import pandas as pd
 import yfinance as yf
+
+from swing_universe import is_excluded_instrument
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
@@ -58,10 +61,20 @@ def filter_exchange(tickers: list[str], include_venture: bool) -> list[str]:
     return [t for t in tickers if not t.endswith(".V")]
 
 
+def filter_instruments(tickers: list[str]) -> list[str]:
+    """Drop non-common instruments (trust/REIT units, USD listings, warrants,
+    rights, debentures, preferreds) by symbol pattern. Yahoo marks all of
+    these quoteType == 'EQUITY', so the downstream equity filter can't catch
+    them; shares swing_universe's symbol rules."""
+    return [t for t in tickers if not is_excluded_instrument(t)]
+
+
 def load_tickers(path: Path) -> list[str]:
     """Read tickers from file, strip blanks/comments, deduplicate (order-preserving)."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    raw = [ln.strip().upper() for ln in lines if ln.strip() and not ln.startswith("#")]
+    # utf-8-sig strips a BOM; comment check runs on the stripped line so
+    # indented comments don't become tickers
+    lines = [ln.strip() for ln in path.read_text(encoding="utf-8-sig").splitlines()]
+    raw = [ln.upper() for ln in lines if ln and not ln.startswith("#")]
     seen: set[str] = set()
     unique: list[str] = []
     for t in raw:
@@ -128,10 +141,12 @@ def fetch_metrics(
     Fetch fundamental metrics for one ticker.
 
     Returned dict fields:
-        ticker, fetched_at, market_cap, quote_type, trailing_pe,
-        book_value, total_revenue, trailing_eps, dollar_vol_30d
+        ticker, fetched_at, market_cap, quote_type, short_name, long_name,
+        trailing_pe, book_value, total_revenue, trailing_eps, dollar_vol_30d
 
-    Returns None on unrecoverable failure (logged to errors log).
+    Returns None on unrecoverable failure (logged to errors log), including
+    an empty info response — which is NOT cached, so a transient rate limit
+    can't poison the cache for CACHE_TTL_HOURS.
     Sleeps only when an actual network request is made.
     """
     if use_cache:
@@ -142,6 +157,15 @@ def fetch_metrics(
     try:
         t = yf.Ticker(ticker)
         info: dict = t.info or {}
+
+        # Rate-limited/broken responses often come back as an empty dict
+        # rather than raising. Treat that as a failed fetch and skip caching —
+        # an all-None metrics dict would otherwise drop the ticker as
+        # "market_cap" for the next CACHE_TTL_HOURS even after recovery.
+        if info.get("marketCap") is None and info.get("quoteType") is None:
+            logger.warning(f"{ticker}: empty info response — treated as fetch failure, not cached")
+            time.sleep(sleep_seconds)
+            return None
 
         dollar_vol_30d: Optional[float] = None
         try:
@@ -159,6 +183,8 @@ def fetch_metrics(
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "market_cap": info.get("marketCap"),
             "quote_type": info.get("quoteType"),
+            "short_name": info.get("shortName"),
+            "long_name": info.get("longName"),
             "trailing_pe": info.get("trailingPE"),
             "book_value": info.get("bookValue"),
             "total_revenue": info.get("totalRevenue"),
@@ -179,6 +205,11 @@ def fetch_metrics(
 
 # ─── Filters ─────────────────────────────────────────────────────────────────
 
+# CDRs (Canadian Depositary Receipts, e.g. AAPL.NE) are quoteType EQUITY but
+# Yahoo reports the US parent's fundamentals for them — Apple's market cap is
+# not a Canadian value stock. Their listing names always carry "CDR".
+_CDR_RE = re.compile(r"\bCDR\b")
+
 
 def apply_filters(
         tickers: list[str],
@@ -192,14 +223,19 @@ def apply_filters(
         logger: logging.Logger,
 ) -> tuple[list[str], dict[str, int]]:
     """
-    Apply filters 2–6 in sequence (exchange filter already applied by caller).
+    Apply the metric filters in sequence (exchange and instrument filters
+    already applied by the caller). Cheap, definitive checks run first so
+    the drop attribution in the summary is honest.
 
-    Drops per stage:
-        fetch_failure  — yfinance returned None or raised
+    Drops per stage (a ticker is counted at its first failing stage):
+        fetch_failure  — yfinance returned None, raised, or sent empty info
+        non_equity     — quoteType != 'EQUITY'
+        cdr            — Canadian Depositary Receipt of a US stock
         market_cap     — below min_market_cap
         liquidity      — avg daily dollar vol (30d) below min_dollar_volume
-        fundamentals   — trailing P/E, book value, or revenue missing
-        non_equity     — quoteType != 'EQUITY'
+        fundamentals   — book value or revenue missing (trailing P/E is NOT
+                         required: Yahoo omits it whenever EPS <= 0, which
+                         would make include_unprofitable unreachable)
         neg_eps        — trailing EPS <= 0 (when include_unprofitable=False)
 
     Returns (passing_tickers, drop_counts_by_stage).
@@ -207,10 +243,11 @@ def apply_filters(
     passing: list[str] = []
     drops: dict[str, int] = {
         "fetch_failure": 0,
+        "non_equity": 0,
+        "cdr": 0,
         "market_cap": 0,
         "liquidity": 0,
         "fundamentals": 0,
-        "non_equity": 0,
         "neg_eps": 0,
     }
 
@@ -231,28 +268,39 @@ def apply_filters(
             drops["fetch_failure"] += 1
             continue
 
-        # Filter 2: Market cap floor
+        # Filter 2: Equity only — definitive and free, so it runs first and
+        # ETFs/funds are attributed here instead of as missing fundamentals
+        if m.get("quote_type") != "EQUITY":
+            drops["non_equity"] += 1
+            continue
+
+        # Filter 3: CDRs carry the US parent's fundamentals — exclude
+        name = f"{m.get('short_name') or ''} {m.get('long_name') or ''}"
+        if _CDR_RE.search(name.upper()):
+            drops["cdr"] += 1
+            continue
+
+        # Filter 4: Market cap floor
         mc = m.get("market_cap")
         if mc is None or mc < min_market_cap:
             drops["market_cap"] += 1
             continue
 
-        # Filter 3: Liquidity floor — avg daily dollar vol, last 30 trading days
+        # Filter 5: Liquidity floor — avg daily dollar vol, last 30 trading days
         dv = m.get("dollar_vol_30d")
         if dv is None or dv < min_dollar_volume:
             drops["liquidity"] += 1
             continue
 
-        # Filter 4: Fundamentals must be present
-        pe = m.get("trailing_pe")
+        # Filter 6: Fundamentals must be present (trailing P/E deliberately
+        # not required — see docstring)
         bv = m.get("book_value")
         rev = m.get("total_revenue")
-        if pe is None or bv is None or rev is None:
+        if bv is None or rev is None:
             drops["fundamentals"] += 1
             missing = [
                 name
                 for name, val in [
-                    ("trailing_pe", pe),
                     ("book_value", bv),
                     ("total_revenue", rev),
                 ]
@@ -261,12 +309,7 @@ def apply_filters(
             logger.warning(f"{ticker}: dropped — missing fundamentals: {', '.join(missing)}")
             continue
 
-        # Filter 5: Equity only
-        if m.get("quote_type") != "EQUITY":
-            drops["non_equity"] += 1
-            continue
-
-        # Filter 6: Positive earnings
+        # Filter 7: Positive earnings
         if not include_unprofitable:
             eps = m.get("trailing_eps")
             if eps is None or eps <= 0:
@@ -293,6 +336,9 @@ def main() -> None:
                         help="Output ticker file")
     parser.add_argument("--include-venture", action="store_true",
                         help="Include TSX Venture (.V) tickers (excluded by default)")
+    parser.add_argument("--include-non-common", action="store_true",
+                        help="Include units (-UN), preferreds, warrants, rights and "
+                             "debentures (excluded by default)")
     parser.add_argument("--min-market-cap", type=float, default=500_000_000, metavar="CAD",
                         help="Minimum market cap in CAD")
     parser.add_argument("--min-dollar-volume", type=float, default=1_000_000, metavar="CAD",
@@ -322,6 +368,11 @@ def main() -> None:
     tickers = filter_exchange(all_tickers, args.include_venture)
     dropped_exchange = raw_count - len(tickers)
 
+    pre_instrument = len(tickers)
+    if not args.include_non_common:
+        tickers = filter_instruments(tickers)
+    dropped_instrument = pre_instrument - len(tickers)
+
     # ── Header ────────────────────────────────────────────────────────────────
     sep = "─" * 54
     print()
@@ -336,7 +387,9 @@ def main() -> None:
     print(sep)
     print(f"  Input count:      {raw_count}")
     if not args.include_venture:
-        print(f"  After exchange:   {len(tickers)}  (dropped {dropped_exchange} .V tickers)")
+        print(f"  After exchange:   {raw_count - dropped_exchange}  (dropped {dropped_exchange} .V tickers)")
+    if not args.include_non_common:
+        print(f"  After instrument: {len(tickers)}  (dropped {dropped_instrument} units/prefs/warrants)")
     print(sep)
     print()
 
@@ -359,7 +412,7 @@ def main() -> None:
     # Build rows: (label, surviving_count, dropped_this_stage)
     rows: list[tuple[str, int, Optional[int]]] = []
     remaining = len(tickers)
-    rows.append(("Loaded (post-exchange filter)", remaining, None))
+    rows.append(("Loaded (post-exchange/instrument)", remaining, None))
 
     def _row(label: str, key: str) -> None:
         nonlocal remaining
@@ -368,10 +421,11 @@ def main() -> None:
         rows.append((label, remaining, d if d else None))
 
     _row("After fetch failures", "fetch_failure")
+    _row("After equity-only filter", "non_equity")
+    _row("After CDR filter", "cdr")
     _row("After market cap filter", "market_cap")
     _row("After liquidity filter", "liquidity")
     _row("After fundamentals check", "fundamentals")
-    _row("After equity-only filter", "non_equity")
     if not args.include_unprofitable:
         _row("After profitability filter", "neg_eps")
 

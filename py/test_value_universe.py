@@ -23,6 +23,7 @@ from value_universe import (
     apply_filters,
     fetch_metrics,
     filter_exchange,
+    filter_instruments,
     load_tickers,
     save_tickers,
 )
@@ -47,6 +48,8 @@ def _metrics(**overrides) -> dict:
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "market_cap": 200_000_000_000,   # $200B CAD
         "quote_type": "EQUITY",
+        "short_name": "Royal Bank of Canada",
+        "long_name": "Royal Bank of Canada",
         "trailing_pe": 12.0,
         "book_value": 50.0,
         "total_revenue": 20_000_000_000,
@@ -81,6 +84,20 @@ def test_load_tickers_strips_blanks_and_comments(tmp_path: Path) -> None:
 def test_load_tickers_uppercases(tmp_path: Path) -> None:
     f = tmp_path / "tickers.txt"
     f.write_text("ry.to\ntd.to\n")
+    assert load_tickers(f) == ["RY.TO", "TD.TO"]
+
+
+def test_load_tickers_skips_indented_comments(tmp_path: Path) -> None:
+    """The comment check runs on the stripped line — an indented comment must
+    not become a garbage ticker."""
+    f = tmp_path / "tickers.txt"
+    f.write_text("RY.TO\n   # indented comment\nTD.TO\n")
+    assert load_tickers(f) == ["RY.TO", "TD.TO"]
+
+
+def test_load_tickers_strips_utf8_bom(tmp_path: Path) -> None:
+    f = tmp_path / "tickers.txt"
+    f.write_bytes("﻿RY.TO\nTD.TO\n".encode("utf-8"))
     assert load_tickers(f) == ["RY.TO", "TD.TO"]
 
 
@@ -126,6 +143,19 @@ def test_filter_exchange_preserves_order() -> None:
 def test_filter_exchange_does_not_drop_cn_or_ne() -> None:
     tickers = ["NVDA.NE", "AAA.CN", "SHOP.TO"]
     assert filter_exchange(tickers, include_venture=False) == tickers
+
+
+# ─── filter_instruments ───────────────────────────────────────────────────────
+
+
+def test_filter_instruments_drops_units_prefs_warrants() -> None:
+    tickers = ["RY.TO", "PMZ-UN.TO", "RY-PA.TO", "ABC-WT.TO", "GHI-DB.TO", "HHL-U.TO"]
+    assert filter_instruments(tickers) == ["RY.TO"]
+
+
+def test_filter_instruments_keeps_share_classes() -> None:
+    tickers = ["BBD-B.TO", "GIB-A.TO", "TD.TO"]
+    assert filter_instruments(tickers) == tickers
 
 
 # ─── cache ────────────────────────────────────────────────────────────────────
@@ -197,6 +227,8 @@ def test_fetch_metrics_maps_fields_correctly(mock_cls: MagicMock, cache_dir: Pat
     mock_cls.return_value = _mock_ticker({
         "marketCap": 100_000_000_000,
         "quoteType": "EQUITY",
+        "shortName": "ROYAL BANK OF CANADA",
+        "longName": "Royal Bank of Canada",
         "trailingPE": 15.0,
         "bookValue": 40.0,
         "totalRevenue": 5_000_000_000,
@@ -207,6 +239,8 @@ def test_fetch_metrics_maps_fields_correctly(mock_cls: MagicMock, cache_dir: Pat
     assert result is not None
     assert result["market_cap"] == 100_000_000_000
     assert result["quote_type"] == "EQUITY"
+    assert result["short_name"] == "ROYAL BANK OF CANADA"
+    assert result["long_name"] == "Royal Bank of Canada"
     assert result["trailing_pe"] == 15.0
     assert result["book_value"] == 40.0
     assert result["total_revenue"] == 5_000_000_000
@@ -218,6 +252,17 @@ def test_fetch_metrics_maps_fields_correctly(mock_cls: MagicMock, cache_dir: Pat
 def test_fetch_metrics_returns_none_on_exception(mock_cls: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
     mock_cls.side_effect = Exception("network error")
     assert fetch_metrics("BAD.TO", use_cache=False, cache_dir=cache_dir, sleep_seconds=0, logger=logger) is None
+
+
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_empty_info_returns_none_and_is_not_cached(mock_cls: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    """Rate-limited responses come back as an empty info dict rather than an
+    exception. They must count as fetch failures and must NOT be cached —
+    otherwise a transient outage poisons the cache for the full TTL."""
+    mock_cls.return_value = _mock_ticker({})
+    result = fetch_metrics("RY.TO", use_cache=True, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
+    assert result is None
+    assert not _cache_path("RY.TO", cache_dir).exists()
 
 
 @patch("value_universe.yf.Ticker")
@@ -314,10 +359,13 @@ def test_apply_filters_dollar_vol_below_threshold_drops_ticker() -> None:
     assert drops["liquidity"] == 1
 
 
-def test_apply_filters_missing_pe_drops_ticker() -> None:
+def test_apply_filters_missing_pe_alone_no_longer_drops() -> None:
+    """Yahoo omits trailingPE exactly when EPS <= 0, so requiring it made
+    --include-unprofitable unreachable. P/E absence alone must not drop a
+    ticker — profitability is judged by the EPS filter."""
     passing, drops = _run_filters(["X.TO"], lambda t, **kw: _metrics(trailing_pe=None))
-    assert passing == []
-    assert drops["fundamentals"] == 1
+    assert passing == ["X.TO"]
+    assert drops["fundamentals"] == 0
 
 
 def test_apply_filters_missing_book_value_drops_ticker() -> None:
@@ -339,6 +387,49 @@ def test_apply_filters_non_equity_drops_ticker() -> None:
         assert drops["non_equity"] == 1
 
 
+def test_apply_filters_cdr_dropped_by_short_name() -> None:
+    """CDRs are quoteType EQUITY with the US parent's fundamentals — the
+    listing name is the only reliable marker."""
+    passing, drops = _run_filters(
+        ["AAPL.NE"],
+        lambda t, **kw: _metrics(ticker=t, short_name="APPLE CDR (CAD HEDGED)",
+                                 market_cap=3_000_000_000_000),
+    )
+    assert passing == []
+    assert drops["cdr"] == 1
+
+
+def test_apply_filters_cdr_dropped_by_long_name_only() -> None:
+    passing, drops = _run_filters(
+        ["MSFT.NE"],
+        lambda t, **kw: _metrics(ticker=t, short_name=None,
+                                 long_name="Microsoft CDR (CAD Hedged)"),
+    )
+    assert passing == []
+    assert drops["cdr"] == 1
+
+
+def test_apply_filters_cdr_match_requires_word_boundary() -> None:
+    """'CDR' inside a longer word (e.g. CDRO) must not trigger the filter."""
+    passing, drops = _run_filters(
+        ["X.TO"],
+        lambda t, **kw: _metrics(short_name="CDRO HOLDINGS INC"),
+    )
+    assert passing == ["X.TO"]
+    assert drops["cdr"] == 0
+
+
+def test_apply_filters_missing_name_fields_pass_cdr_check() -> None:
+    """Cached entries written before the schema change have no name fields —
+    they must flow through the CDR check, not crash or get dropped."""
+    passing, drops = _run_filters(
+        ["X.TO"],
+        lambda t, **kw: _metrics(short_name=None, long_name=None),
+    )
+    assert passing == ["X.TO"]
+    assert drops["cdr"] == 0
+
+
 def test_apply_filters_negative_eps_drops_ticker() -> None:
     passing, drops = _run_filters(["X.TO"], lambda t, **kw: _metrics(trailing_eps=-0.01))
     assert passing == []
@@ -358,13 +449,17 @@ def test_apply_filters_none_eps_drops_ticker() -> None:
 
 
 def test_apply_filters_include_unprofitable_keeps_negative_eps() -> None:
+    """Uses the realistic Yahoo shape for an unprofitable company: negative
+    EPS AND no trailingPE. Requiring P/E at the fundamentals stage used to
+    drop these before the flag could ever apply."""
     passing, drops = _run_filters(
         ["X.TO"],
-        lambda t, **kw: _metrics(trailing_eps=-5.0),
+        lambda t, **kw: _metrics(trailing_eps=-5.0, trailing_pe=None),
         include_unprofitable=True,
     )
     assert passing == ["X.TO"]
     assert drops["neg_eps"] == 0
+    assert drops["fundamentals"] == 0
 
 
 def test_apply_filters_each_ticker_drops_at_exactly_one_stage() -> None:
@@ -374,13 +469,15 @@ def test_apply_filters_each_ticker_drops_at_exactly_one_stage() -> None:
             "FAIL.TO":    None,
             "SMALL.TO":   _metrics(market_cap=1),
             "ILLIQ.TO":   _metrics(dollar_vol_30d=1),
-            "NOFUND.TO":  _metrics(trailing_pe=None),
+            "NOFUND.TO":  _metrics(book_value=None),
             "ETF.TO":     _metrics(quote_type="ETF"),
+            "AAPL.NE":    _metrics(short_name="APPLE CDR (CAD HEDGED)"),
             "LOSS.TO":    _metrics(trailing_eps=-1.0),
             "GOOD.TO":    _metrics(ticker="GOOD.TO"),
         }[t]
 
-    tickers = ["FAIL.TO", "SMALL.TO", "ILLIQ.TO", "NOFUND.TO", "ETF.TO", "LOSS.TO", "GOOD.TO"]
+    tickers = ["FAIL.TO", "SMALL.TO", "ILLIQ.TO", "NOFUND.TO", "ETF.TO",
+               "AAPL.NE", "LOSS.TO", "GOOD.TO"]
     passing, drops = _run_filters(tickers, fetch)
 
     assert passing == ["GOOD.TO"]
@@ -391,6 +488,7 @@ def test_apply_filters_each_ticker_drops_at_exactly_one_stage() -> None:
     assert drops["liquidity"] == 1
     assert drops["fundamentals"] == 1
     assert drops["non_equity"] == 1
+    assert drops["cdr"] == 1
     assert drops["neg_eps"] == 1
 
 
@@ -402,3 +500,17 @@ def test_apply_filters_drop_order_market_cap_before_liquidity() -> None:
     )
     assert drops["market_cap"] == 1
     assert drops["liquidity"] == 0
+
+
+def test_apply_filters_non_equity_attributed_before_metric_filters() -> None:
+    """The free, definitive quoteType check runs first: an ETF with no
+    revenue must count as non_equity, not as missing fundamentals (the old
+    order made the summary claim most ETFs lacked fundamentals)."""
+    passing, drops = _run_filters(
+        ["ETF.TO"],
+        lambda t, **kw: _metrics(quote_type="ETF", total_revenue=None, market_cap=1),
+    )
+    assert passing == []
+    assert drops["non_equity"] == 1
+    assert drops["fundamentals"] == 0
+    assert drops["market_cap"] == 0

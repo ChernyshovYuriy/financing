@@ -23,7 +23,7 @@ Run from repo root (no network calls — yfinance is fully mocked in both suites
 # Swing universe builder — 177 tests
 python -m pytest py/test_swing_universe.py -v
 
-# Value universe builder — 40 tests
+# Value universe builder — 50 tests
 python -m pytest py/test_value_universe.py -v
 
 # Both suites together
@@ -53,7 +53,7 @@ cd py && python fetch_tickers.py
 
 ## Architecture
 
-Four independent scripts, no shared module. Each is self-contained with its own config dataclass:
+Independent scripts, each self-contained with its own config dataclass. One exception: `value_universe.py` imports `is_excluded_instrument` from `swing_universe.py` so both builders share the same non-common-instrument symbol rules (units `-UN`, USD listings `-U`, warrants, rights, debentures, preferreds `-P*`).
 
 ### `py/swing_universe.py` — Swing Universe Builder
 Finds Canadian stocks suitable for 1–3 week swing trades. Pipeline:
