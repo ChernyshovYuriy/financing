@@ -23,7 +23,7 @@ Run from repo root (no network calls — yfinance is fully mocked in both suites
 # Swing universe builder — 177 tests
 python -m pytest py/test_swing_universe.py -v
 
-# Value universe builder — 50 tests
+# Value universe builder — 70 tests
 python -m pytest py/test_value_universe.py -v
 
 # Both suites together

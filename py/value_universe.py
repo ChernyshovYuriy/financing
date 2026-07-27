@@ -158,12 +158,15 @@ def fetch_metrics(
         t = yf.Ticker(ticker)
         info: dict = t.info or {}
 
-        # Rate-limited/broken responses often come back as an empty dict
-        # rather than raising. Treat that as a failed fetch and skip caching —
-        # an all-None metrics dict would otherwise drop the ticker as
-        # "market_cap" for the next CACHE_TTL_HOURS even after recovery.
-        if info.get("marketCap") is None and info.get("quoteType") is None:
-            logger.warning(f"{ticker}: empty info response — treated as fetch failure, not cached")
+        # Rate-limited/broken responses are often empty or partial rather
+        # than raising. An empty dict, or an EQUITY quote with no marketCap,
+        # is failure-shaped: treat as a failed fetch and skip caching so a
+        # transient outage can't poison the cache for CACHE_TTL_HOURS.
+        # ETFs/funds legitimately lack marketCap — those are cached normally
+        # and dropped as non_equity downstream.
+        quote_type = info.get("quoteType")
+        if info.get("marketCap") is None and quote_type in (None, "EQUITY"):
+            logger.warning(f"{ticker}: failure-shaped info response — not cached")
             time.sleep(sleep_seconds)
             return None
 
@@ -193,7 +196,12 @@ def fetch_metrics(
         }
 
         if use_cache:
-            _save_cache(ticker, metrics, cache_dir)
+            # a cache write failure (disk full, permissions) must not discard
+            # a successful fetch — the metrics are still good this run
+            try:
+                _save_cache(ticker, metrics, cache_dir)
+            except Exception as cache_exc:
+                logger.warning(f"{ticker}: cache write failed — {cache_exc}")
 
         time.sleep(sleep_seconds)
         return metrics
@@ -204,6 +212,14 @@ def fetch_metrics(
 
 
 # ─── Filters ─────────────────────────────────────────────────────────────────
+
+
+def _is_missing(v: object) -> bool:
+    """None or NaN. Yahoo uses both for absent numerics, and NaN slips
+    through `x < threshold` guards (NaN compares False to everything) —
+    a NaN EPS would pass the profitability filter that drops None."""
+    return v is None or (isinstance(v, float) and math.isnan(v))
+
 
 # CDRs (Canadian Depositary Receipts, e.g. AAPL.NE) are quoteType EQUITY but
 # Yahoo reports the US parent's fundamentals for them — Apple's market cap is
@@ -282,13 +298,13 @@ def apply_filters(
 
         # Filter 4: Market cap floor
         mc = m.get("market_cap")
-        if mc is None or mc < min_market_cap:
+        if _is_missing(mc) or mc < min_market_cap:
             drops["market_cap"] += 1
             continue
 
         # Filter 5: Liquidity floor — avg daily dollar vol, last 30 trading days
         dv = m.get("dollar_vol_30d")
-        if dv is None or dv < min_dollar_volume:
+        if _is_missing(dv) or dv < min_dollar_volume:
             drops["liquidity"] += 1
             continue
 
@@ -296,7 +312,7 @@ def apply_filters(
         # not required — see docstring)
         bv = m.get("book_value")
         rev = m.get("total_revenue")
-        if bv is None or rev is None:
+        if _is_missing(bv) or _is_missing(rev):
             drops["fundamentals"] += 1
             missing = [
                 name
@@ -304,7 +320,7 @@ def apply_filters(
                     ("book_value", bv),
                     ("total_revenue", rev),
                 ]
-                if val is None
+                if _is_missing(val)
             ]
             logger.warning(f"{ticker}: dropped — missing fundamentals: {', '.join(missing)}")
             continue
@@ -312,7 +328,7 @@ def apply_filters(
         # Filter 7: Positive earnings
         if not include_unprofitable:
             eps = m.get("trailing_eps")
-            if eps is None or eps <= 0:
+            if _is_missing(eps) or eps <= 0:
                 drops["neg_eps"] += 1
                 continue
 

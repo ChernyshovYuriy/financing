@@ -87,6 +87,31 @@ def test_load_tickers_uppercases(tmp_path: Path) -> None:
     assert load_tickers(f) == ["RY.TO", "TD.TO"]
 
 
+def test_load_tickers_missing_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        load_tickers(tmp_path / "does_not_exist.txt")
+
+
+def test_load_tickers_empty_file_returns_empty_list(tmp_path: Path) -> None:
+    f = tmp_path / "tickers.txt"
+    f.write_text("")
+    assert load_tickers(f) == []
+
+
+def test_load_tickers_handles_crlf_line_endings(tmp_path: Path) -> None:
+    f = tmp_path / "tickers.txt"
+    f.write_bytes(b"RY.TO\r\nTD.TO\r\n")
+    assert load_tickers(f) == ["RY.TO", "TD.TO"]
+
+
+def test_load_tickers_inline_comment_kept_as_part_of_ticker(tmp_path: Path) -> None:
+    """Documents current behavior: only whole-line comments are stripped — an
+    inline comment stays glued to the ticker (and later fails as no_data)."""
+    f = tmp_path / "tickers.txt"
+    f.write_text("RY.TO # bank\n")
+    assert load_tickers(f) == ["RY.TO # BANK"]
+
+
 def test_load_tickers_skips_indented_comments(tmp_path: Path) -> None:
     """The comment check runs on the stripped line — an indented comment must
     not become a garbage ticker."""
@@ -201,6 +226,34 @@ def test_cache_handles_nan_values(cache_dir: Path) -> None:
     assert result["dollar_vol_30d"] is None  # NaN serialised as null
 
 
+def test_cache_hit_with_naive_fetched_at_treated_as_utc(cache_dir: Path) -> None:
+    """A tz-naive fetched_at (older cache format) is assumed UTC, not local."""
+    naive_recent = datetime.now(timezone.utc).replace(tzinfo=None)
+    data = _metrics(fetched_at=naive_recent.isoformat())
+    _save_cache("RY.TO", data, cache_dir)
+    assert _load_cache("RY.TO", cache_dir) is not None
+
+
+def test_cache_miss_when_fetched_at_key_missing(cache_dir: Path) -> None:
+    """A record without fetched_at can't prove freshness → treated as a miss."""
+    data = _metrics()
+    del data["fetched_at"]
+    _save_cache("RY.TO", data, cache_dir)
+    assert _load_cache("RY.TO", cache_dir) is None
+
+
+def test_cache_hit_just_inside_ttl(cache_dir: Path) -> None:
+    """An entry a few seconds younger than the TTL is still a hit."""
+    almost_expired = (
+        datetime.now(timezone.utc)
+        - timedelta(hours=CACHE_TTL_HOURS)
+        + timedelta(seconds=30)
+    )
+    data = _metrics(fetched_at=almost_expired.isoformat())
+    _save_cache("RY.TO", data, cache_dir)
+    assert _load_cache("RY.TO", cache_dir) is not None
+
+
 def test_cache_filename_escapes_dots(cache_dir: Path) -> None:
     p = _cache_path("SHOP.TO", cache_dir)
     assert ".TO" not in p.name
@@ -263,6 +316,94 @@ def test_fetch_metrics_empty_info_returns_none_and_is_not_cached(mock_cls: Magic
     result = fetch_metrics("RY.TO", use_cache=True, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
     assert result is None
     assert not _cache_path("RY.TO", cache_dir).exists()
+
+
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_partial_equity_response_not_cached(mock_cls: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    """A rate-limited partial response (quoteType present, marketCap stripped)
+    is failure-shaped for an equity: fetch failure, nothing cached."""
+    mock_cls.return_value = _mock_ticker({"quoteType": "EQUITY"})
+    result = fetch_metrics("RY.TO", use_cache=True, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
+    assert result is None
+    assert not _cache_path("RY.TO", cache_dir).exists()
+
+
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_etf_without_market_cap_is_cached(mock_cls: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    """ETFs legitimately lack marketCap — they must be fetched and cached
+    normally (and get dropped as non_equity downstream), not refetched as a
+    failure on every run."""
+    mock_cls.return_value = _mock_ticker({"quoteType": "ETF", "shortName": "SOME INDEX ETF"})
+    result = fetch_metrics("XIU.TO", use_cache=True, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
+    assert result is not None
+    assert result["quote_type"] == "ETF"
+    assert _cache_path("XIU.TO", cache_dir).exists()
+
+
+@patch("value_universe._save_cache")
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_cache_write_failure_keeps_metrics(mock_cls: MagicMock, mock_save: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    """A cache write failure (disk full, permissions) must not discard a
+    successful fetch — previously the ticker became a fetch_failure."""
+    mock_cls.return_value = _mock_ticker({"marketCap": 1_000_000_000, "quoteType": "EQUITY"})
+    mock_save.side_effect = OSError("disk full")
+    result = fetch_metrics("RY.TO", use_cache=True, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
+    assert result is not None
+    assert result["market_cap"] == 1_000_000_000
+
+
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_empty_history_yields_none_dollar_vol(mock_cls: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    mock_t = MagicMock()
+    mock_t.info = {"marketCap": 1_000_000_000, "quoteType": "EQUITY"}
+    mock_t.history.return_value = pd.DataFrame()
+    mock_cls.return_value = mock_t
+    result = fetch_metrics("RY.TO", use_cache=False, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
+    assert result is not None
+    assert result["dollar_vol_30d"] is None
+
+
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_short_history_averages_available_days(mock_cls: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    """A recent listing with <30 bars: the '30-day' dollar volume silently
+    averages over whatever is available (documents current behavior)."""
+    mock_cls.return_value = _mock_ticker({"marketCap": 1_000_000_000, "quoteType": "EQUITY"},
+                                         history_rows=10)
+    result = fetch_metrics("NEW.TO", use_cache=False, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
+    assert result is not None
+    assert result["dollar_vol_30d"] == pytest.approx(20.0 * 500_000)
+
+
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_all_nan_history_yields_none_dollar_vol(mock_cls: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    mock_t = MagicMock()
+    mock_t.info = {"marketCap": 1_000_000_000, "quoteType": "EQUITY"}
+    mock_t.history.return_value = pd.DataFrame({
+        "Close": [float("nan")] * 30,
+        "Volume": [float("nan")] * 30,
+    })
+    mock_cls.return_value = mock_t
+    result = fetch_metrics("RY.TO", use_cache=False, cache_dir=cache_dir, sleep_seconds=0, logger=logger)
+    assert result is not None
+    assert result["dollar_vol_30d"] is None
+
+
+@patch("value_universe.time.sleep")
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_sleeps_after_network_fetch(mock_cls: MagicMock, mock_sleep: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    mock_cls.return_value = _mock_ticker({"marketCap": 1_000_000_000, "quoteType": "EQUITY"})
+    fetch_metrics("RY.TO", use_cache=False, cache_dir=cache_dir, sleep_seconds=0.5, logger=logger)
+    mock_sleep.assert_called_once_with(0.5)
+
+
+@patch("value_universe.time.sleep")
+@patch("value_universe.yf.Ticker")
+def test_fetch_metrics_no_sleep_on_cache_hit(mock_cls: MagicMock, mock_sleep: MagicMock, cache_dir: Path, logger: logging.Logger) -> None:
+    """The rate-limit sleep must be skipped on cache hits — otherwise a
+    warm-cache run of thousands of tickers pointlessly sleeps for minutes."""
+    _save_cache("RY.TO", _metrics(), cache_dir)
+    fetch_metrics("RY.TO", use_cache=True, cache_dir=cache_dir, sleep_seconds=0.5, logger=logger)
+    mock_sleep.assert_not_called()
 
 
 @patch("value_universe.yf.Ticker")
@@ -385,6 +526,40 @@ def test_apply_filters_non_equity_drops_ticker() -> None:
         passing, drops = _run_filters(["X.TO"], lambda t, **kw: _metrics(quote_type=qt))
         assert passing == [], f"expected drop for quoteType={qt!r}"
         assert drops["non_equity"] == 1
+
+
+def test_apply_filters_nan_market_cap_dropped() -> None:
+    """NaN compares False against thresholds, so an unguarded `mc <
+    min_market_cap` would let a NaN market cap through — it must drop."""
+    passing, drops = _run_filters(["X.TO"], lambda t, **kw: _metrics(market_cap=float("nan")))
+    assert passing == []
+    assert drops["market_cap"] == 1
+
+
+def test_apply_filters_nan_dollar_vol_dropped() -> None:
+    passing, drops = _run_filters(["X.TO"], lambda t, **kw: _metrics(dollar_vol_30d=float("nan")))
+    assert passing == []
+    assert drops["liquidity"] == 1
+
+
+def test_apply_filters_nan_book_value_dropped() -> None:
+    passing, drops = _run_filters(["X.TO"], lambda t, **kw: _metrics(book_value=float("nan")))
+    assert passing == []
+    assert drops["fundamentals"] == 1
+
+
+def test_apply_filters_nan_eps_dropped() -> None:
+    """The sneakiest variant: NaN EPS passed the `eps <= 0` profitability
+    check that correctly drops None."""
+    passing, drops = _run_filters(["X.TO"], lambda t, **kw: _metrics(trailing_eps=float("nan")))
+    assert passing == []
+    assert drops["neg_eps"] == 1
+
+
+def test_apply_filters_empty_ticker_list() -> None:
+    passing, drops = _run_filters([], lambda t, **kw: _metrics())
+    assert passing == []
+    assert all(v == 0 for v in drops.values())
 
 
 def test_apply_filters_cdr_dropped_by_short_name() -> None:
