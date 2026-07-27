@@ -110,6 +110,12 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
+def _today() -> pd.Timestamp:
+    """Current date, normalized. Separate function so tests can pin the clock
+    — staleness math must not depend on which weekday the suite runs on."""
+    return pd.Timestamp.today().normalize()
+
+
 def safe_last(s: pd.Series) -> float:
     s = s.dropna()
     return float(s.iloc[-1]) if len(s) else float("nan")
@@ -168,7 +174,7 @@ def analyze_symbol(df: pd.DataFrame,
     last_date = close.index[-1]
     if hasattr(last_date, "tz_localize"):
         last_date = last_date.tz_localize(None) if last_date.tzinfo else last_date
-    days_stale = (pd.Timestamp.today().normalize() - pd.Timestamp(last_date).normalize()).days
+    days_stale = (_today() - pd.Timestamp(last_date).normalize()).days
     out["days_stale"] = int(days_stale)
 
     # ── Liquidity ────────────────────────────────────────────────────────────

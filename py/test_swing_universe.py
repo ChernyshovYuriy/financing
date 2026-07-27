@@ -35,6 +35,7 @@ from swing_universe import (
     chunked,
     compute_atr,
     fetch_benchmark,
+    fetch_history_batch,
     is_excluded_instrument,
     pass_filters,
     read_tickers,
@@ -415,22 +416,29 @@ def test_analyze_above_200d_false_when_fewer_than_200_bars():
     assert result["above_200d"] is False
 
 
-def test_analyze_days_stale_zero_for_fresh_data():
-    df = _ohlcv(n=252, end_date=pd.Timestamp.today().normalize())
+# Fixed weekday anchor for staleness tests: bdate_range never rolls a weekday
+# end-date back, so expected days_stale values are exact regardless of which
+# day the suite runs on. The production clock is pinned via swing_universe._today.
+_STALE_ANCHOR = pd.Timestamp("2026-07-22")  # a Wednesday
+
+
+@patch("swing_universe._today", return_value=_STALE_ANCHOR)
+def test_analyze_days_stale_zero_for_fresh_data(_mock_today):
+    df = _ohlcv(n=252, end_date=_STALE_ANCHOR)
     assert analyze_symbol(df)["days_stale"] == 0
 
 
-def test_analyze_days_stale_correct_for_old_data():
-    # Use a multiple of 7 so today-N lands on the same weekday as today.
-    # bdate_range never adjusts a weekday end, so days_stale is exact.
-    stale_end = pd.Timestamp.today().normalize() - pd.Timedelta(days=14)
+@patch("swing_universe._today", return_value=_STALE_ANCHOR)
+def test_analyze_days_stale_correct_for_old_data(_mock_today):
+    stale_end = _STALE_ANCHOR - pd.Timedelta(days=14)  # also a Wednesday
     result = analyze_symbol(_ohlcv(n=252, end_date=stale_end))
     assert result["days_stale"] == 14
 
 
-def test_analyze_days_stale_tz_aware_index_stripped():
+@patch("swing_universe._today", return_value=_STALE_ANCHOR)
+def test_analyze_days_stale_tz_aware_index_stripped(_mock_today):
     """tz-aware DatetimeIndex must not raise — timezone is stripped internally."""
-    stale_end = pd.Timestamp.today().normalize() - pd.Timedelta(days=7)
+    stale_end = _STALE_ANCHOR - pd.Timedelta(days=7)
     df = _ohlcv(n=252, end_date=stale_end, tz="UTC")
     result = analyze_symbol(df)
     assert result["days_stale"] == 7
@@ -459,10 +467,11 @@ def test_analyze_zero_price_atr_pct_nan():
     assert math.isnan(result["atr_pct_14"])
 
 
-def test_analyze_days_stale_negative_for_future_dated_bar():
+@patch("swing_universe._today", return_value=_STALE_ANCHOR)
+def test_analyze_days_stale_negative_for_future_dated_bar(_mock_today):
     """A future-dated last bar yields negative staleness (and passes the
     stale filter) — documents current behavior."""
-    future_end = pd.Timestamp.today().normalize() + pd.Timedelta(days=7)
+    future_end = _STALE_ANCHOR + pd.Timedelta(days=7)
     result = analyze_symbol(_ohlcv(n=252, end_date=future_end))
     assert result["days_stale"] == -7
     ok, _ = pass_filters(_row(days_stale=result["days_stale"]), TH)
@@ -1035,6 +1044,55 @@ def test_score_sub_100k_adv_contributes_negative():
     below $100k (impossible for a passing row) yields a negative liquidity
     term rather than being clamped at zero."""
     assert score_row({"avg_dollar_vol_20": 10_000.0}) == pytest.approx(-1.0)
+
+
+# ─── fetch_history_batch / auto_adjust plumbing (FIX #1 regression guard) ────
+
+
+@patch("swing_universe.yf.download")
+def test_fetch_history_batch_passes_auto_adjust_to_yfinance(mock_dl):
+    """auto_adjust=True is the load-bearing data-correctness setting (FIX #1):
+    without it, splits/dividends corrupt every SMA/ATR/worst-day figure. Pin
+    the kwargs actually sent to yf.download."""
+    mock_dl.return_value = pd.DataFrame()
+    fetch_history_batch(["RY.TO", "TD.TO"], "1y", "1d", True)
+
+    kwargs = mock_dl.call_args.kwargs
+    assert kwargs["auto_adjust"] is True
+    assert kwargs["tickers"] == ["RY.TO", "TD.TO"]
+    assert kwargs["period"] == "1y"
+    assert kwargs["interval"] == "1d"
+    assert kwargs["group_by"] == "ticker"
+    assert kwargs["progress"] is False
+
+
+@patch("swing_universe.yf.download")
+def test_fetch_benchmark_passes_auto_adjust_to_yfinance(mock_dl):
+    dates = pd.bdate_range(end="2024-01-10", periods=50)
+    mock_dl.return_value = pd.DataFrame({"Close": np.full(50, 30.0)}, index=dates)
+    fetch_benchmark("XIU.TO", "1y", "1d", True)
+
+    assert mock_dl.call_args.args == ("XIU.TO",)
+    kwargs = mock_dl.call_args.kwargs
+    assert kwargs["auto_adjust"] is True
+    assert kwargs["period"] == "1y"
+    assert kwargs["interval"] == "1d"
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_forwards_auto_adjust_to_both_fetchers(mock_batch, mock_bench, _sleep, tmp_path):
+    """run_universe_builder must forward cfg.auto_adjust into both fetch
+    helpers — a config regression here would silently corrupt all metrics."""
+    mock_bench.return_value = _bench()
+    mock_batch.return_value = _multiindex_df(["RY.TO"])
+
+    run_universe_builder(_cfg(tmp_path, "RY.TO\n", auto_adjust=True))
+
+    # both helpers take (…, period, interval, auto_adjust) positionally
+    assert mock_bench.call_args.args[3] is True
+    assert mock_batch.call_args.args[3] is True
 
 
 # ─── fetch_benchmark ─────────────────────────────────────────────────────────
