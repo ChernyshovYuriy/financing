@@ -23,6 +23,11 @@ Fixes applied vs original:
       volatility on top of ATR
   #14 Non-common instruments (units/-UN, USD listings/-U, warrants, rights,
       debentures, preferreds) excluded by symbol pattern before download
+  #15 ATR computed on valid-Close bars only and read strictly at the last
+      bar — halted days no longer NaN it, and no stale walk-back via safe_last
+  #16 RS skipped when the benchmark's last common bar lags the stock by more
+      than 3 bars (stale benchmark would shift the RS endpoint into the past);
+      RS exception handling narrowed to alignment errors
 
 Run from IDE:
     from swing_universe import UniverseBuilderConfig, run_universe_builder
@@ -145,6 +150,11 @@ def slope_of_series(s: pd.Series, lookback: int = 10) -> float:
 # ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# FIX #16: if the last date the stock and benchmark share is more than this
+# many stock bars in the past, RS would measure a stale endpoint — skip it.
+_MAX_RS_ENDPOINT_LAG_BARS = 3
+
+
 def analyze_symbol(df: pd.DataFrame,
                    bench_close: Optional[pd.Series] = None) -> Dict:
     """
@@ -193,8 +203,14 @@ def analyze_symbol(df: pd.DataFrame,
     out["sma50_slope"] = slope_of_series(sma50, lookback=10)
 
     # ── ATR ──────────────────────────────────────────────────────────────────
-    atr_series = compute_atr(df, period=14)
-    atr_last = safe_last(atr_series)
+    # FIX #15: compute on bars with a valid Close — halted days (all-NaN OHLC
+    # rows that survive dropna(how="all") because Volume is 0) would otherwise
+    # NaN the TR and every recent rolling window. Read the value strictly at
+    # the last bar: walking back via safe_last would report a stale ATR as
+    # current.
+    ohlc = df[df["Close"].notna()]
+    atr_series = compute_atr(ohlc, period=14)
+    atr_last = float(atr_series.iloc[-1]) if len(atr_series) else float("nan")
     out["atr_14"] = atr_last
     out["atr_pct_14"] = float(atr_last / last_close) if (not np.isnan(atr_last) and last_close > 0) else float("nan")
 
@@ -219,12 +235,22 @@ def analyze_symbol(df: pd.DataFrame,
         try:
             # Align on common dates
             aligned_stock, aligned_bench = close.align(bench_close, join="inner")
-            for label, bars in [("rs_1m", 21), ("rs_3m", 63)]:
-                if len(aligned_stock) >= bars and len(aligned_bench) >= bars:
-                    s_ret = aligned_stock.iloc[-1] / aligned_stock.iloc[-bars] - 1
-                    b_ret = aligned_bench.iloc[-1] / aligned_bench.iloc[-bars] - 1
-                    out[label] = float(s_ret - b_ret)
-        except Exception:
+            # FIX #16: a benchmark staler than the stock would silently shift
+            # the RS endpoint into the past — only compute RS when the common
+            # range ends close enough to the stock's own last bar.
+            endpoint_lag = (
+                int((close.index > aligned_stock.index[-1]).sum())
+                if len(aligned_stock) else 0
+            )
+            if len(aligned_stock) and endpoint_lag <= _MAX_RS_ENDPOINT_LAG_BARS:
+                for label, bars in [("rs_1m", 21), ("rs_3m", 63)]:
+                    if len(aligned_stock) >= bars and len(aligned_bench) >= bars:
+                        s_ret = aligned_stock.iloc[-1] / aligned_stock.iloc[-bars] - 1
+                        b_ret = aligned_bench.iloc[-1] / aligned_bench.iloc[-bars] - 1
+                        out[label] = float(s_ret - b_ret)
+        except (TypeError, ValueError):
+            # FIX #16: alignment failures (e.g. tz-aware vs tz-naive indexes)
+            # degrade RS to NaN; anything else should surface, not be swallowed
             pass
 
     return out

@@ -20,7 +20,7 @@ pip install tabulate                     # optional: prettier output in wheel_sc
 Run from repo root (no network calls — yfinance is fully mocked in both suites):
 
 ```bash
-# Swing universe builder — 173 tests
+# Swing universe builder — 177 tests
 python -m pytest py/test_swing_universe.py -v
 
 # Value universe builder — 40 tests

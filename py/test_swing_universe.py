@@ -456,6 +456,46 @@ def test_analyze_atr_nan_with_fewer_than_14_bars():
     assert math.isnan(result["atr_pct_14"])
 
 
+def test_analyze_atr_ignores_halted_all_nan_ohlc_days():
+    """FIX #15: halted days (all-NaN OHLC, Volume 0) survive dropna(how='all')
+    in the pipeline. They must not leave ATR NaN or stale — the halted bars
+    are dropped and ATR reflects the most recent real bars."""
+    n = 60
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+    closes = np.full(n, 20.0)
+    # bars 0-39: H-L = 2.0; bars 40+: H-L = 6.0 (so stale vs current differ)
+    half_spread = np.where(np.arange(n) >= 40, 3.0, 1.0)
+    df = pd.DataFrame(
+        {
+            "Open": closes,
+            "High": closes + half_spread,
+            "Low": closes - half_spread,
+            "Close": closes,
+            "Volume": np.full(n, 100_000.0),
+        },
+        index=dates,
+    )
+    # halt on bars 50-52
+    df.iloc[50:53, df.columns.get_indexer(["Open", "High", "Low", "Close"])] = float("nan")
+    df.iloc[50:53, df.columns.get_indexer(["Volume"])] = 0.0
+
+    result = analyze_symbol(df)
+    # All 14 bars of the cleaned last window sit in the wide zone → ATR = 6.0.
+    # The old safe_last walk-back returned a pre-halt window mixing narrow
+    # bars (≈4.86); NaN would mean the halt days poisoned the rolling window.
+    assert result["atr_pct_14"] == pytest.approx(6.0 / 20.0, rel=0.01)
+
+
+def test_analyze_atr_nan_when_recent_bars_lack_range_data():
+    """FIX #15: if the last bar has a Close but no High/Low, ATR is NaN (→
+    atr_unavailable rejection) instead of silently reporting an older window's
+    ATR as current."""
+    df = _ohlcv(n=60)
+    df.iloc[-1, df.columns.get_indexer(["High", "Low"])] = float("nan")
+    result = analyze_symbol(df)
+    assert math.isnan(result["atr_pct_14"])
+
+
 def test_analyze_zero_price_atr_pct_nan():
     """last_close == 0 must not divide — atr_pct_14 stays NaN."""
     df = _ohlcv(n=60, drift=0.0)
@@ -609,6 +649,29 @@ def test_analyze_rs_3m_computed_at_exactly_63_bars():
     )
     result = analyze_symbol(df, bench_close=bench)
     assert not math.isnan(result["rs_3m"])
+
+
+def test_analyze_rs_nan_when_benchmark_much_staler_than_stock():
+    """FIX #16: a benchmark whose data ends well before the stock's last bar
+    must not produce an RS presented as current — it degrades to NaN."""
+    df = _ohlcv(n=252)
+    bench = pd.Series(np.full(252 - 15, 30.0), index=df.index[:-15])
+    result = analyze_symbol(df, bench_close=bench)
+    assert math.isnan(result["rs_1m"])
+    assert math.isnan(result["rs_3m"])
+
+
+def test_analyze_rs_endpoint_lag_boundary():
+    """FIX #16 boundary: a lag of up to 3 stock bars is tolerated, 4 is not."""
+    df = _ohlcv(n=252)
+    at_limit = analyze_symbol(
+        df, bench_close=pd.Series(np.full(252 - 3, 30.0), index=df.index[:-3])
+    )
+    over_limit = analyze_symbol(
+        df, bench_close=pd.Series(np.full(252 - 4, 30.0), index=df.index[:-4])
+    )
+    assert not math.isnan(at_limit["rs_1m"])
+    assert math.isnan(over_limit["rs_1m"])
 
 
 def test_analyze_rs_nan_with_tz_aware_benchmark():
