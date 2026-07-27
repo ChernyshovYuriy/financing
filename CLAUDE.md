@@ -20,7 +20,7 @@ pip install tabulate                     # optional: prettier output in wheel_sc
 Run from repo root (no network calls — yfinance is fully mocked in both suites):
 
 ```bash
-# Swing universe builder — 115 tests
+# Swing universe builder — 170 tests
 python -m pytest py/test_swing_universe.py -v
 
 # Value universe builder — 40 tests
@@ -57,11 +57,11 @@ Four independent scripts, no shared module. Each is self-contained with its own 
 
 ### `py/swing_universe.py` — Swing Universe Builder
 Finds Canadian stocks suitable for 1–3 week swing trades. Pipeline:
-1. Loads tickers from a text file (`data/can_tickers` or `data/can_tickers_full`)
+1. Loads tickers from a text file (`data/can_tickers` or `data/can_tickers_full`), dropping non-common instruments by symbol pattern (`-UN`, `-U`, `-WT`, `-RT`, `-DB`, preferred `-P*`) before download
 2. Downloads 1y daily OHLCV history in batches via `yf.download()` (batch_size=80, with sleep between batches to avoid rate limits)
 3. Per-ticker: computes ATR-14, dollar volume, SMA50/SMA200, worst 1-day return, SMA50 slope (normalized by price), relative strength vs benchmark (XIU.TO), volume trend
-4. Applies hard filters (`Thresholds`): price, dollar volume, ATR%, worst-day drop, above SMA50, stale data
-5. Scores passing tickers: liquidity (log scale), trend alignment, RS vs benchmark, volume trend, ATR/worst-day penalties
+4. Applies hard filters (`Thresholds`): price, dollar volume, ATR% band (min 1.5% / max 5%), worst-day drop, above SMA50, stale data
+5. Scores passing tickers: RS vs benchmark (top-weighted), ATR sweet-spot bonus (peak 2.5–3.5%), liquidity (log scale, capped at 2), trend alignment, volume trend
 6. Outputs: `data/can_tickers_swing_universe` (one per line), `out/can_tickers_swing_one_line` (comma-separated), `out/can_tickers_rejected.csv`
 
 Entry points: `run_universe_builder(cfg: UniverseBuilderConfig)` or `__main__` with `--out`, `--out-one-line`, `--out-rejected`, `--input` args.

@@ -31,9 +31,11 @@ from swing_universe import (
     UniverseBuilderConfig,
     _process_symbol,
     analyze_symbol,
+    atr_band_bonus,
     chunked,
     compute_atr,
     fetch_benchmark,
+    is_excluded_instrument,
     pass_filters,
     read_tickers,
     run_universe_builder,
@@ -157,6 +159,27 @@ def test_read_tickers_strips_whitespace(tmp_path):
     assert read_tickers(str(tmp_path / "t.txt")) == ["RY.TO", "TD.TO"]
 
 
+def test_read_tickers_strips_utf8_bom(tmp_path):
+    """A BOM must not become part of the first ticker."""
+    (tmp_path / "t.txt").write_bytes("﻿RY.TO\nTD.TO\n".encode("utf-8"))
+    assert read_tickers(str(tmp_path / "t.txt")) == ["RY.TO", "TD.TO"]
+
+
+def test_read_tickers_handles_crlf_line_endings(tmp_path):
+    (tmp_path / "t.txt").write_bytes(b"RY.TO\r\nTD.TO\r\n")
+    assert read_tickers(str(tmp_path / "t.txt")) == ["RY.TO", "TD.TO"]
+
+
+def test_read_tickers_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        read_tickers(str(tmp_path / "does_not_exist.txt"))
+
+
+def test_read_tickers_empty_file_returns_empty_list(tmp_path):
+    (tmp_path / "t.txt").write_text("")
+    assert read_tickers(str(tmp_path / "t.txt")) == []
+
+
 # ─── chunked ─────────────────────────────────────────────────────────────────
 
 
@@ -185,6 +208,11 @@ def test_chunked_preserves_all_items():
     items = list("ABCDEFGHIJ")
     flat = [x for chunk in chunked(items, 3) for x in chunk]
     assert flat == items
+
+
+def test_chunked_size_zero_raises():
+    with pytest.raises(ValueError):
+        chunked(["A"], 0)
 
 
 # ─── compute_atr ─────────────────────────────────────────────────────────────
@@ -285,6 +313,11 @@ def test_slope_exactly_at_lookback_not_nan():
     assert not math.isnan(slope_of_series(s, lookback=10))
 
 
+def test_slope_lookback_1_returns_nan():
+    """lookback=1 → zero x-variance → NaN, not a division error."""
+    assert math.isnan(slope_of_series(pd.Series([1.0, 2.0, 3.0]), lookback=1))
+
+
 def test_slope_normalization_higher_price_smaller_value():
     """Same raw $/bar slope must produce a smaller normalized slope for a more expensive stock."""
     low_price = pd.Series([10.0 + i for i in range(20)])
@@ -297,6 +330,24 @@ def test_slope_normalization_higher_price_smaller_value():
 
 def test_analyze_missing_volume_column_sets_error():
     df = pd.DataFrame({"Open": [1.0], "High": [1.1], "Low": [0.9], "Close": [1.0]})
+    result = analyze_symbol(df)
+    assert "error" in result
+    assert "Volume" in result["error"]
+
+
+def test_analyze_missing_high_column_sets_error():
+    df = pd.DataFrame(
+        {"Open": [1.0], "Low": [0.9], "Close": [1.0], "Volume": [100_000.0]}
+    )
+    result = analyze_symbol(df)
+    assert "error" in result
+    assert "High" in result["error"]
+
+
+def test_analyze_all_nan_volume_sets_error():
+    """Valid Close but all-NaN Volume must hit the error path, not compute."""
+    df = _ohlcv(n=60)
+    df["Volume"] = float("nan")
     result = analyze_symbol(df)
     assert "error" in result
     assert "Volume" in result["error"]
@@ -390,6 +441,39 @@ def test_analyze_atr_pct_close_to_spread():
     df = _ohlcv(n=60, price=20.0, atr_pct=0.02, drift=0.0)
     result = analyze_symbol(df)
     assert pytest.approx(result["atr_pct_14"], abs=0.003) == 0.02
+
+
+def test_analyze_atr_nan_with_fewer_than_14_bars():
+    result = analyze_symbol(_ohlcv(n=10))
+    assert math.isnan(result["atr_pct_14"])
+
+
+def test_analyze_zero_price_atr_pct_nan():
+    """last_close == 0 must not divide — atr_pct_14 stays NaN."""
+    df = _ohlcv(n=60, drift=0.0)
+    df["Close"] = 0.0
+    df["Open"] = 0.0
+    df["High"] = 0.1
+    df["Low"] = 0.0
+    result = analyze_symbol(df)
+    assert math.isnan(result["atr_pct_14"])
+
+
+def test_analyze_days_stale_negative_for_future_dated_bar():
+    """A future-dated last bar yields negative staleness (and passes the
+    stale filter) — documents current behavior."""
+    future_end = pd.Timestamp.today().normalize() + pd.Timedelta(days=7)
+    result = analyze_symbol(_ohlcv(n=252, end_date=future_end))
+    assert result["days_stale"] == -7
+    ok, _ = pass_filters(_row(days_stale=result["days_stale"]), TH)
+    assert ok
+
+
+def test_analyze_worst_1d_ret_uses_full_history_below_126_bars():
+    """With fewer than 126 bars the worst-day window falls back to the full
+    return series instead of returning NaN."""
+    result = analyze_symbol(_ohlcv(n=63, drift=-0.002))
+    assert result["worst_1d_ret_126"] < 0.0
 
 
 def test_analyze_worst_1d_ret_zero_for_flat_series():
@@ -499,6 +583,35 @@ def test_analyze_rs_nan_when_no_date_overlap():
     assert math.isnan(result["rs_3m"])
 
 
+def test_analyze_rs_3m_computed_at_exactly_63_bars():
+    """Boundary: exactly 63 common bars is enough for rs_3m."""
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=63)
+    closes = pd.Series(np.full(63, 20.0), index=dates)
+    bench = pd.Series(np.full(63, 30.0), index=dates)
+    df = pd.DataFrame(
+        {
+            "Open": closes,
+            "High": closes * 1.005,
+            "Low": closes * 0.995,
+            "Close": closes,
+            "Volume": np.full(63, 100_000.0),
+        },
+        index=dates,
+    )
+    result = analyze_symbol(df, bench_close=bench)
+    assert not math.isnan(result["rs_3m"])
+
+
+def test_analyze_rs_nan_with_tz_aware_benchmark():
+    """A tz-aware benchmark against a tz-naive stock index can't align —
+    RS silently degrades to NaN (documents current behavior)."""
+    bench = _bench()
+    bench.index = bench.index.tz_localize("UTC")
+    result = analyze_symbol(_ohlcv(), bench_close=bench)
+    assert math.isnan(result["rs_1m"])
+    assert math.isnan(result["rs_3m"])
+
+
 def test_analyze_rs_1m_computed_but_3m_nan_with_only_21_bars():
     """Exactly 21 common bars → rs_1m computed, rs_3m NaN (needs 63)."""
     dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=21)
@@ -577,7 +690,7 @@ def test_pass_adv_at_min_passes():
 
 def test_pass_atr_nan_rejected():
     ok, reasons = pass_filters(_row(atr_pct_14=float("nan")), TH)
-    assert not ok and "too_volatile_atr" in reasons
+    assert not ok and "atr_unavailable" in reasons
 
 
 def test_pass_atr_above_max_rejected():
@@ -588,6 +701,18 @@ def test_pass_atr_above_max_rejected():
 def test_pass_atr_at_max_passes():
     # strict > so atr == max_atr passes
     ok, _ = pass_filters(_row(atr_pct_14=0.05), TH)
+    assert ok
+
+
+def test_pass_atr_below_min_rejected():
+    # FIX #11: volatility floor — 1% ATR can't deliver a 1-3 week swing
+    ok, reasons = pass_filters(_row(atr_pct_14=0.01), TH)
+    assert not ok and "too_quiet_atr" in reasons
+
+
+def test_pass_atr_at_min_passes():
+    # strict < so atr == min_atr passes
+    ok, _ = pass_filters(_row(atr_pct_14=0.015), TH)
     assert ok
 
 
@@ -664,6 +789,53 @@ def test_pass_each_reject_reason_independent():
     assert len(reasons) == 6
 
 
+# ─── is_excluded_instrument (FIX #14) ────────────────────────────────────────
+
+
+@pytest.mark.parametrize("symbol", [
+    "PMZ-UN.TO",   # REIT / trust unit
+    "AP-UN.TO",
+    "BTB-UN.TO",
+    "HHL-U.TO",    # USD-denominated listing
+    "ABC-WT.TO",   # warrant
+    "DEF-RT.V",    # right
+    "GHI-DB.TO",   # debenture
+    "RY-PA.TO",    # preferred series
+    "ENB-PC.TO",
+])
+def test_excluded_instrument_true(symbol):
+    assert is_excluded_instrument(symbol) is True
+
+
+@pytest.mark.parametrize("symbol", [
+    "RY.TO",       # plain common
+    "BBD-B.TO",    # share class B — must be kept
+    "GIB-A.TO",    # share class A — must be kept
+    "POW.TO",
+    "UNI.TO",      # 'UN' inside the root, not a suffix
+    "DBM.TO",
+])
+def test_excluded_instrument_false(symbol):
+    assert is_excluded_instrument(symbol) is False
+
+
+def test_excluded_instrument_expects_uppercase():
+    """Contract: symbols are matched uppercase (read_tickers uppercases);
+    lowercase input is NOT recognized."""
+    assert is_excluded_instrument("pmz-un.to") is False
+
+
+def test_excluded_instrument_works_without_exchange_suffix():
+    assert is_excluded_instrument("PMZ-UN") is True
+    assert is_excluded_instrument("RY") is False
+
+
+def test_excluded_instrument_single_letter_class_p_kept():
+    """A hypothetical class-P common share is kept — only two-letter
+    preferred series (-PA..-PZ) are excluded."""
+    assert is_excluded_instrument("X-P.TO") is False
+
+
 # ─── score_row ───────────────────────────────────────────────────────────────
 
 
@@ -676,14 +848,14 @@ def test_score_liquidity_1m():
     assert score_row({"avg_dollar_vol_20": 1_000_000.0}) == pytest.approx(1.0)
 
 
-def test_score_liquidity_10m():
-    # log10(1e7) - 5 = 2.0
+def test_score_liquidity_10m_hits_cap():
+    # log10(1e7) - 5 = 2.0, exactly at the cap
     assert score_row({"avg_dollar_vol_20": 10_000_000.0}) == pytest.approx(2.0)
 
 
-def test_score_liquidity_capped_at_3():
-    # $1B → log10(1e9)-5=4.0, capped at 3.0
-    assert score_row({"avg_dollar_vol_20": 1_000_000_000.0}) == pytest.approx(3.0)
+def test_score_liquidity_capped_at_2():
+    # $1B → log10(1e9)-5=4.0, capped at 2.0 so mega-caps can't drown momentum
+    assert score_row({"avg_dollar_vol_20": 1_000_000_000.0}) == pytest.approx(2.0)
 
 
 def test_score_liquidity_nan_zero_contribution():
@@ -714,27 +886,44 @@ def test_score_positive_slope_capped_at_1_5():
 
 
 def test_score_rs1m_positive_proportional():
-    # 0.05 * 20 = 1.0
-    assert score_row({"rs_1m": 0.05}) == pytest.approx(1.0)
+    # 0.05 * 25 = 1.25
+    assert score_row({"rs_1m": 0.05}) == pytest.approx(1.25)
 
 
 def test_score_rs1m_capped_positive():
-    # 0.10 * 20 = 2.0 (cap)
-    assert score_row({"rs_1m": 0.10}) == pytest.approx(2.0)
+    # 0.15 * 25 = 3.75, capped at 2.5
+    assert score_row({"rs_1m": 0.15}) == pytest.approx(2.5)
 
 
 def test_score_rs1m_capped_negative():
-    # -0.10 * 20 = -2.0 (floor)
-    assert score_row({"rs_1m": -0.10}) == pytest.approx(-2.0)
+    # -0.15 * 25 = -3.75, floored at -2.5
+    assert score_row({"rs_1m": -0.15}) == pytest.approx(-2.5)
+
+
+def test_score_rs3m_positive_proportional():
+    # 0.10 * 12 = 1.2
+    assert score_row({"rs_3m": 0.10}) == pytest.approx(1.2)
 
 
 def test_score_rs3m_capped_positive():
-    # 0.15 * 10 = 1.5 (cap)
-    assert score_row({"rs_3m": 0.15}) == pytest.approx(1.5)
+    # 0.20 * 12 = 2.4, capped at 2.0
+    assert score_row({"rs_3m": 0.20}) == pytest.approx(2.0)
 
 
 def test_score_rs3m_capped_negative():
-    assert score_row({"rs_3m": -0.15}) == pytest.approx(-1.5)
+    # -0.20 * 12 = -2.4, floored at -2.0
+    assert score_row({"rs_3m": -0.20}) == pytest.approx(-2.0)
+
+
+def test_score_rs_outweighs_liquidity():
+    """FIX: strong RS (±4.5 pts total) must outweigh max liquidity (2.0 pts)."""
+    liquid_laggard = score_row(
+        {"avg_dollar_vol_20": 1_000_000_000.0, "rs_1m": -0.10, "rs_3m": -0.20}
+    )
+    thin_leader = score_row(
+        {"avg_dollar_vol_20": 1_000_000.0, "rs_1m": 0.10, "rs_3m": 0.20}
+    )
+    assert thin_leader > liquid_laggard
 
 
 def test_score_vol_trend_up_adds_0_8():
@@ -756,41 +945,60 @@ def test_score_vol_ratio_capped_at_0_5():
     assert score_row({"vol_ratio_20_50": 5.0}) == pytest.approx(0.5)
 
 
-def test_score_atr_penalty():
-    # 0.03 * 15 = 0.45
-    assert score_row({"atr_pct_14": 0.03}) == pytest.approx(-0.45)
+# ─── atr_band_bonus (FIX #12) ────────────────────────────────────────────────
 
 
-def test_score_atr_penalty_capped_at_2():
-    # 0.20 * 15 = 3.0, capped at 2.0
-    assert score_row({"atr_pct_14": 0.20}) == pytest.approx(-2.0)
+def test_atr_band_nan_zero():
+    assert atr_band_bonus(float("nan")) == pytest.approx(0.0)
 
 
-def test_score_worst_day_penalty():
-    # |-0.10| * 10 = 1.0
-    assert score_row({"worst_1d_ret_126": -0.10}) == pytest.approx(-1.0)
+def test_atr_band_below_ramp_zero():
+    assert atr_band_bonus(0.010) == pytest.approx(0.0)
 
 
-def test_score_worst_day_penalty_capped_at_2_5():
-    # |-0.30| * 10 = 3.0, capped at 2.5
-    assert score_row({"worst_1d_ret_126": -0.30}) == pytest.approx(-2.5)
+def test_atr_band_at_ramp_lo_zero():
+    assert atr_band_bonus(0.015) == pytest.approx(0.0)
 
 
-def test_score_atr_penalty_cap_unreachable_for_passing_stock():
-    """
-    A stock passing the ATR filter (max 5%) can only accumulate a penalty of
-    5% * 15 = 0.75, well below the 2.0 cap. The cap is dead code for real
-    candidates and only guards against extreme inputs.
-    """
-    assert score_row({"atr_pct_14": 0.05}) == pytest.approx(-0.75)
+def test_atr_band_mid_ramp_up():
+    # halfway between 0.015 and 0.025 → half of peak 1.5
+    assert atr_band_bonus(0.020) == pytest.approx(0.75)
 
 
-def test_score_worst_penalty_cap_unreachable_for_passing_stock():
-    """
-    A stock passing the worst-day filter (-15% floor) accumulates at most
-    |-0.15| * 10 = 1.5, well below the 2.5 cap.
-    """
-    assert score_row({"worst_1d_ret_126": -0.15}) == pytest.approx(-1.5)
+def test_atr_band_sweet_spot_full_peak():
+    assert atr_band_bonus(0.025) == pytest.approx(1.5)
+    assert atr_band_bonus(0.030) == pytest.approx(1.5)
+    assert atr_band_bonus(0.035) == pytest.approx(1.5)
+
+
+def test_atr_band_ramp_down():
+    # (0.05 - 0.04) / (0.05 - 0.035) = 2/3 of peak 1.5
+    assert atr_band_bonus(0.040) == pytest.approx(1.0)
+
+
+def test_atr_band_at_ramp_hi_zero():
+    assert atr_band_bonus(0.05) == pytest.approx(0.0)
+
+
+def test_atr_band_above_ramp_hi_zero():
+    assert atr_band_bonus(0.20) == pytest.approx(0.0)
+
+
+def test_score_atr_sweet_spot_rewarded():
+    """FIX #12: ATR in the sweet spot must add points via score_row."""
+    assert score_row({"atr_pct_14": 0.03}) == pytest.approx(1.5)
+
+
+def test_score_atr_swing_range_beats_quiet():
+    """A 3% ATR mover must outscore a 0.8% ATR sleeper — the old penalty
+    ranked them the other way around."""
+    assert score_row({"atr_pct_14": 0.03}) > score_row({"atr_pct_14": 0.008})
+
+
+def test_score_worst_day_no_score_effect():
+    """FIX #13: worst-day is a hard filter only — it must not move the score."""
+    assert score_row({"worst_1d_ret_126": -0.10}) == pytest.approx(0.0)
+    assert score_row({"worst_1d_ret_126": -0.30}) == pytest.approx(0.0)
 
 
 def test_score_higher_rs_higher_score():
@@ -803,6 +1011,32 @@ def test_score_higher_liquidity_higher_score():
     )
 
 
+def test_score_full_row_integration():
+    """Pin the total for one realistic passing row so component interactions
+    can't drift silently."""
+    row = {
+        "avg_dollar_vol_20": 5_000_000.0,   # log10(5e6) - 5
+        "above_50d": True,                  # +1.0
+        "above_200d": True,                 # +2.0
+        "sma50_slope": 0.002,               # min(1.5, 0.002*500) = 1.0
+        "rs_1m": 0.04,                      # 0.04*25 = 1.0
+        "rs_3m": 0.05,                      # 0.05*12 = 0.6
+        "vol_trend_up": True,               # +0.8
+        "vol_ratio_20_50": 1.2,             # (1.2-1.0)*2.0 = 0.4
+        "atr_pct_14": 0.03,                 # sweet spot = +1.5
+        "worst_1d_ret_126": -0.08,          # no score effect
+    }
+    expected = (math.log10(5e6) - 5) + 1.0 + 2.0 + 1.0 + 1.0 + 0.6 + 0.8 + 0.4 + 1.5
+    assert score_row(row) == pytest.approx(expected)
+
+
+def test_score_sub_100k_adv_contributes_negative():
+    """Documents current behavior: score_row assumes filtered input — an ADV
+    below $100k (impossible for a passing row) yields a negative liquidity
+    term rather than being clamped at zero."""
+    assert score_row({"avg_dollar_vol_20": 10_000.0}) == pytest.approx(-1.0)
+
+
 # ─── fetch_benchmark ─────────────────────────────────────────────────────────
 
 
@@ -813,6 +1047,34 @@ def test_fetch_benchmark_returns_tz_naive_series(mock_dl):
     result = fetch_benchmark("XIU.TO", "1y", "1d", True)
     assert not result.empty
     assert result.index.tz is None
+
+
+@patch("swing_universe.yf.download")
+def test_fetch_benchmark_multiindex_columns_squeezed_to_series(mock_dl):
+    """Newer yfinance returns MultiIndex (field, ticker) columns even for a
+    single ticker — raw['Close'] is then a one-column DataFrame that must be
+    squeezed into a Series."""
+    dates = pd.bdate_range(end="2024-01-10", periods=50)
+    mock_dl.return_value = pd.DataFrame(
+        {("Close", "XIU.TO"): np.full(50, 30.0),
+         ("Volume", "XIU.TO"): np.full(50, 1e6)},
+        index=dates,
+    )
+    result = fetch_benchmark("XIU.TO", "1y", "1d", True)
+    assert isinstance(result, pd.Series)
+    assert len(result) == 50
+    assert result.iloc[-1] == 30.0
+
+
+@patch("swing_universe.yf.download")
+def test_fetch_benchmark_empty_download_returns_empty_series(mock_dl):
+    mock_dl.return_value = pd.DataFrame(
+        {"Close": pd.Series(dtype=float)},
+        index=pd.DatetimeIndex([]),
+    )
+    result = fetch_benchmark("XIU.TO", "1y", "1d", True)
+    assert isinstance(result, pd.Series)
+    assert result.empty
 
 
 @patch("swing_universe.yf.download")
@@ -837,6 +1099,43 @@ def test_pipeline_two_passing_tickers(mock_batch, mock_bench, _sleep, tmp_path):
     df_t, df_r = run_universe_builder(_cfg(tmp_path, "RY.TO\nTD.TO\n"))
     assert len(df_t) == 2
     assert len(df_r) == 0
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_excludes_non_common_before_download(mock_batch, mock_bench, _sleep, tmp_path):
+    """FIX #14: -UN units are rejected up front and never sent to yfinance."""
+    mock_bench.return_value = _bench()
+    mock_batch.return_value = _multiindex_df(["RY.TO"])
+
+    cfg = _cfg(tmp_path, "RY.TO\nPMZ-UN.TO\n")
+    df_t, df_r = run_universe_builder(cfg)
+
+    assert "PMZ-UN.TO" in set(df_r["symbol"])
+    rej = df_r[df_r["symbol"] == "PMZ-UN.TO"].iloc[0]
+    assert rej["reject_reasons"] == "excluded_instrument"
+    # Only the common share was fetched
+    fetched = mock_batch.call_args[0][0]
+    assert fetched == ["RY.TO"]
+    assert "PMZ-UN.TO" not in set(df_t["symbol"])
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_exclusion_can_be_disabled(mock_batch, mock_bench, _sleep, tmp_path):
+    """With exclude_non_common=False, unit tickers go through the normal path."""
+    mock_bench.return_value = _bench()
+    mock_batch.return_value = _multiindex_df(["PMZ-UN.TO"])
+
+    cfg = _cfg(tmp_path, "PMZ-UN.TO\n",
+               thresholds=Thresholds(exclude_non_common=False))
+    df_t, df_r = run_universe_builder(cfg)
+
+    fetched = mock_batch.call_args[0][0]
+    assert fetched == ["PMZ-UN.TO"]
+    assert len(df_t) == 1  # passes all metric filters like any other ticker
 
 
 @patch("swing_universe.time.sleep")
@@ -944,15 +1243,139 @@ def test_pipeline_ticker_absent_from_batch_is_rejected_no_data(mock_batch, mock_
 @patch("swing_universe.time.sleep")
 @patch("swing_universe.fetch_benchmark")
 @patch("swing_universe.fetch_history_batch")
-def test_pipeline_batch_exception_does_not_crash(mock_batch, mock_bench, _sleep, tmp_path):
-    """A network-level batch exception is caught; no ticker rows are added for that batch."""
+def test_pipeline_batch_exception_tickers_land_in_rejected(mock_batch, mock_bench, _sleep, tmp_path):
+    """A network-level batch exception is caught and every ticker of the failed
+    batch appears in df_rejected — it must not silently vanish."""
     mock_bench.return_value = _bench()
     mock_batch.side_effect = RuntimeError("rate limit hit")
 
     cfg = _cfg(tmp_path, "RY.TO\nTD.TO\n")
     df_t, df_r = run_universe_builder(cfg)
-    # All tickers skipped → nothing tradable, nothing rejected (rows never appended)
     assert len(df_t) == 0
+    assert set(df_r["symbol"]) == {"RY.TO", "TD.TO"}
+    assert (df_r["reject_reasons"] == "batch_fetch_failed").all()
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_every_input_ticker_accounted_for(mock_batch, mock_bench, _sleep, tmp_path):
+    """Invariant: every input ticker ends up in exactly one of df_tradable /
+    df_rejected, across the excluded, failed-batch, and normal paths."""
+    mock_bench.return_value = _bench()
+    # First batch (size 2) raises; second batch returns data for BNS.TO only
+    mock_batch.side_effect = [
+        RuntimeError("rate limit hit"),
+        _multiindex_df(["BNS.TO"]),
+    ]
+
+    cfg = _cfg(tmp_path, "RY.TO\nTD.TO\nBNS.TO\nCM.TO\nPMZ-UN.TO\n", batch_size=2)
+    df_t, df_r = run_universe_builder(cfg)
+
+    all_syms = sorted(df_t["symbol"].tolist() + df_r["symbol"].tolist())
+    assert all_syms == ["BNS.TO", "CM.TO", "PMZ-UN.TO", "RY.TO", "TD.TO"]
+    assert len(df_t) + len(df_r) == 5
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_creates_missing_output_dirs(mock_batch, mock_bench, _sleep, tmp_path):
+    """All three output files must create their parent directories, not just
+    the universe file."""
+    mock_bench.return_value = _bench()
+    mock_batch.return_value = _multiindex_df(["RY.TO"])
+
+    cfg = _cfg(
+        tmp_path, "RY.TO\n",
+        out_file_path=str(tmp_path / "a/universe"),
+        out_one_line_file_path=str(tmp_path / "b/nested/one_line"),
+        out_rejected_file_path=str(tmp_path / "c/nested/rejected.csv"),
+    )
+    run_universe_builder(cfg)
+    assert Path(cfg.out_file_path).exists()
+    assert Path(cfg.out_one_line_file_path).exists()
+    assert Path(cfg.out_rejected_file_path).exists()
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_flat_df_multi_ticker_batch_rejected_as_ambiguous(mock_batch, mock_bench, _sleep, tmp_path):
+    """Flat (unlabeled) columns for a multi-ticker batch: the data can't be
+    attributed to a symbol, so the whole batch is rejected — batch[0] must NOT
+    be credited with prices that may belong to another ticker."""
+    mock_bench.return_value = _bench()
+    mock_batch.return_value = _ohlcv(n=252)  # flat frame, batch of 2
+
+    cfg = _cfg(tmp_path, "DEAD.TO\nRY.TO\n", batch_size=2)
+    df_t, df_r = run_universe_builder(cfg)
+
+    assert len(df_t) == 0
+    assert set(df_r["symbol"]) == {"DEAD.TO", "RY.TO"}
+    assert (df_r["reject_reasons"] == "ambiguous_flat_data").all()
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_empty_download_rejects_whole_batch_no_data(mock_batch, mock_bench, _sleep, tmp_path):
+    """A completely empty DataFrame (total download failure) marks every
+    ticker of the batch as no_data."""
+    mock_bench.return_value = _bench()
+    mock_batch.return_value = pd.DataFrame()
+
+    df_t, df_r = run_universe_builder(_cfg(tmp_path, "RY.TO\nTD.TO\n"))
+    assert len(df_t) == 0
+    assert (df_r["reject_reasons"] == "no_data").all()
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_all_tickers_excluded_completes(mock_batch, mock_bench, _sleep, tmp_path):
+    """Everything excluded up front → zero batches, empty universe files,
+    pipeline still completes and writes all outputs."""
+    mock_bench.return_value = _bench()
+
+    cfg = _cfg(tmp_path, "PMZ-UN.TO\nRY-PA.TO\n")
+    df_t, df_r = run_universe_builder(cfg)
+
+    mock_batch.assert_not_called()
+    assert len(df_t) == 0 and len(df_r) == 2
+    assert Path(cfg.out_file_path).read_text() == ""
+    # one-line file degrades to a single newline for an empty universe
+    assert Path(cfg.out_one_line_file_path).read_text() == "\n"
+    assert Path(cfg.out_rejected_file_path).exists()
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_empty_input_file_completes(mock_batch, mock_bench, _sleep, tmp_path):
+    """Zero input tickers → empty outputs, no crash."""
+    mock_bench.return_value = _bench()
+    df_t, df_r = run_universe_builder(_cfg(tmp_path, ""))
+    assert len(df_t) == 0 and len(df_r) == 0
+    mock_batch.assert_not_called()
+
+
+@patch("swing_universe.time.sleep")
+@patch("swing_universe.fetch_benchmark")
+@patch("swing_universe.fetch_history_batch")
+def test_pipeline_multiindex_all_nan_close_ticker_rejected(mock_batch, mock_bench, _sleep, tmp_path):
+    """MultiIndex batch where one ticker has all-NaN Close but valid Volume:
+    the analyzer error path must reject it while the healthy ticker passes."""
+    mock_bench.return_value = _bench()
+    big = _multiindex_df(["RY.TO", "BAD.TO"])
+    big[("BAD.TO", "Close")] = float("nan")
+    mock_batch.return_value = big
+
+    df_t, df_r = run_universe_builder(_cfg(tmp_path, "RY.TO\nBAD.TO\n"))
+    assert "RY.TO" in set(df_t["symbol"])
+    bad = df_r[df_r["symbol"] == "BAD.TO"].iloc[0]
+    assert bad["tradable"] == False
+    assert "Close" in str(bad["error"])
 
 
 @patch("swing_universe.time.sleep")
@@ -1040,6 +1463,17 @@ def test_process_symbol_passing_ticker():
     assert r["tradable"] is True
     assert r["reject_reasons"] == ""
     assert not math.isnan(r["score"])
+
+
+def test_process_symbol_short_history_rejected_atr_unavailable():
+    """<14 bars → ATR is NaN → rejected via atr_unavailable (among others),
+    exercising the NaN-ATR chain end-to-end."""
+    rows = []
+    cfg = UniverseBuilderConfig(thresholds=Thresholds())
+    _process_symbol("NEW.TO", _ohlcv(n=10), _bench(), cfg, rows)
+    r = rows[0]
+    assert r["tradable"] is False
+    assert "atr_unavailable" in r["reject_reasons"].split(",")
 
 
 def test_process_symbol_failing_ticker_score_is_nan():

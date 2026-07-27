@@ -15,6 +15,14 @@ Fixes applied vs original:
   #8  Single-ticker all-NaN column guard added
   #9  df_rejected returned separately for diagnostics
   #10 Stale data check — rejects tickers with last bar > 5 trading days old
+  #11 min_atr_pct_14 hard filter — stocks that barely move can't deliver a
+      1-3 week swing; volatility needs a floor, not just a ceiling
+  #12 ATR scoring is a band reward (peak at 2.5-3.5%) instead of a linear
+      penalty — the old penalty ranked the least-swingable stocks highest
+  #13 Worst-day removed from scoring (still a hard filter) — it double-counted
+      volatility on top of ATR
+  #14 Non-common instruments (units/-UN, USD listings/-U, warrants, rights,
+      debentures, preferreds) excluded by symbol pattern before download
 
 Run from IDE:
     from swing_universe import UniverseBuilderConfig, run_universe_builder
@@ -22,6 +30,7 @@ Run from IDE:
 """
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,11 +49,13 @@ import yfinance as yf
 class Thresholds:
     min_price: float = 1.0
     min_avg_dollar_vol_20: float = 1_000_000.0  # price × volume proxy
+    min_atr_pct_14: float = 0.015  # FIX #11: too quiet to swing below this
     max_atr_pct_14: float = 0.05  # 0.08 — too loose for 1-3w swings
     max_one_day_drop_126: float = -0.15  # worst daily return must be >= -15%
     require_above_50d: bool = True  # hard gate
     prefer_above_200d: bool = True  # soft bonus in scoring (not a hard gate)
     max_stale_days: int = 5  # reject tickers with stale last bar
+    exclude_non_common: bool = True  # FIX #14: drop units/warrants/prefs by symbol
 
 
 @dataclass
@@ -67,7 +78,9 @@ class UniverseBuilderConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def read_tickers(path: str) -> List[str]:
-    with open(path, "r", encoding="utf-8") as f:
+    # utf-8-sig: strips a BOM if present (plain utf-8 files read unchanged);
+    # a BOM would otherwise survive strip() and create a phantom first ticker
+    with open(path, "r", encoding="utf-8-sig") as f:
         lines = [ln.strip().upper() for ln in f.readlines()]
     tickers = [t for t in lines if t and not t.startswith("#")]
     seen, out = set(), []
@@ -215,6 +228,21 @@ def analyze_symbol(df: pd.DataFrame,
 # FILTERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# FIX #14: Yahoo suffix patterns for instruments that structurally don't trend
+# like common shares: trust/REIT units, USD-denominated listings, warrants,
+# rights, debentures, preferred series. Share classes (-A, -B, ...) are kept.
+_NON_COMMON_SUFFIXES = ("-UN", "-U", "-WT", "-RT", "-DB")
+_PREFERRED_RE = re.compile(r"-P[A-Z]$")
+
+
+def is_excluded_instrument(symbol: str) -> bool:
+    """True if the symbol looks like a non-common-share instrument (FIX #14)."""
+    root = symbol.split(".")[0]
+    if any(root.endswith(sfx) for sfx in _NON_COMMON_SUFFIXES):
+        return True
+    return bool(_PREFERRED_RE.search(root))
+
+
 def pass_filters(row: Dict, th: Thresholds) -> Tuple[bool, List[str]]:
     reasons = []
 
@@ -227,8 +255,13 @@ def pass_filters(row: Dict, th: Thresholds) -> Tuple[bool, List[str]]:
         reasons.append("low_dollar_volume")
 
     atr_pct = row.get("atr_pct_14", np.nan)
-    if np.isnan(atr_pct) or atr_pct > th.max_atr_pct_14:
+    if np.isnan(atr_pct):
+        reasons.append("atr_unavailable")
+    elif atr_pct > th.max_atr_pct_14:
         reasons.append("too_volatile_atr")
+    elif atr_pct < th.min_atr_pct_14:
+        # FIX #11: volatility floor — too quiet to swing
+        reasons.append("too_quiet_atr")
 
     worst = row.get("worst_1d_ret_126", np.nan)
     if np.isnan(worst) or worst < th.max_one_day_drop_126:
@@ -249,6 +282,27 @@ def pass_filters(row: Dict, th: Thresholds) -> Tuple[bool, List[str]]:
 # SCORING
 # ─────────────────────────────────────────────────────────────────────────────
 
+def atr_band_bonus(atr_pct: float,
+                   ramp_lo: float = 0.015,
+                   sweet_lo: float = 0.025,
+                   sweet_hi: float = 0.035,
+                   ramp_hi: float = 0.05,
+                   peak: float = 1.5) -> float:
+    """
+    FIX #12: ATR sweet-spot reward for swing trading.
+    Zero at/below ramp_lo, ramps to `peak` across [ramp_lo, sweet_lo], flat
+    through [sweet_lo, sweet_hi], ramps back to zero at ramp_hi. The old
+    linear penalty ranked the quietest stocks highest — backwards for swings.
+    """
+    if np.isnan(atr_pct) or atr_pct <= ramp_lo or atr_pct >= ramp_hi:
+        return 0.0
+    if atr_pct < sweet_lo:
+        return peak * (atr_pct - ramp_lo) / (sweet_lo - ramp_lo)
+    if atr_pct <= sweet_hi:
+        return peak
+    return peak * (ramp_hi - atr_pct) / (ramp_hi - sweet_hi)
+
+
 def score_row(row: Dict) -> float:
     """
     Higher is better. All fixes applied:
@@ -256,13 +310,17 @@ def score_row(row: Dict) -> float:
       - FIX #4:  volume trend bonus added
       - FIX #5:  relative strength (RS) vs benchmark added as top-weighted factor
       - FIX #7:  sma50_slope is now normalized — contribution is meaningful
+      - FIX #12: ATR rewarded in a 2.5-3.5% sweet-spot band, not penalized
+      - FIX #13: worst-day dropped from scoring (hard filter only) — it
+                 double-counted volatility on top of ATR
     """
     score = 0.0
 
-    # ── Liquidity (log scale, ~1–3 pts) ─────────────────────────────────────
+    # ── Liquidity (log scale, ~0–2 pts) ─────────────────────────────────────
     adv = row.get("avg_dollar_vol_20", np.nan)
     if not np.isnan(adv) and adv > 0:
-        score += min(3.0, math.log10(adv) - 5.0)  # capped at 3 (was 5 — dominated score)
+        # capped at 2 (was 3 — mega-caps maxed liquidity and drowned momentum)
+        score += min(2.0, math.log10(adv) - 5.0)
 
     # ── Trend alignment ──────────────────────────────────────────────────────
     if row.get("above_50d", False):
@@ -281,10 +339,10 @@ def score_row(row: Dict) -> float:
     rs_1m = row.get("rs_1m", np.nan)
     rs_3m = row.get("rs_3m", np.nan)
     if not np.isnan(rs_1m):
-        # +/- 10% RS maps to +/- 2.0 pts; capped
-        score += max(-2.0, min(2.0, rs_1m * 20))
+        # +/- 10% RS maps to +/- 2.5 pts; capped
+        score += max(-2.5, min(2.5, rs_1m * 25))
     if not np.isnan(rs_3m):
-        score += max(-1.5, min(1.5, rs_3m * 10))
+        score += max(-2.0, min(2.0, rs_3m * 12))
 
     # ── FIX #4: Volume trend bonus ───────────────────────────────────────────
     if row.get("vol_trend_up", False):
@@ -293,15 +351,11 @@ def score_row(row: Dict) -> float:
     if not np.isnan(vol_ratio) and vol_ratio > 1.1:
         score += min(0.5, (vol_ratio - 1.0) * 2.0)  # extra for strong accumulation
 
-    # ── Volatility penalty (FIX #6: tighter ATR ceiling means fewer extreme cases) ──
-    atr_pct = row.get("atr_pct_14", np.nan)
-    if not np.isnan(atr_pct):
-        score -= min(2.0, atr_pct * 15.0)
+    # ── FIX #12: ATR sweet-spot reward (replaces linear penalty) ────────────
+    score += atr_band_bonus(row.get("atr_pct_14", np.nan))
 
-    # ── Worst-day penalty ────────────────────────────────────────────────────
-    worst = row.get("worst_1d_ret_126", np.nan)
-    if not np.isnan(worst):
-        score -= min(2.5, abs(worst) * 10.0)
+    # FIX #13: worst-day is a hard filter only — no score penalty (it
+    # double-counted volatility on top of ATR).
 
     return float(score)
 
@@ -352,6 +406,19 @@ def run_universe_builder(cfg: UniverseBuilderConfig) -> Tuple[pd.DataFrame, pd.D
     tickers = read_tickers(cfg.tickers_path)
     print(f"Loaded {len(tickers)} tickers from {cfg.tickers_path}")
 
+    rows: List[Dict] = []
+
+    # FIX #14: drop non-common instruments by symbol before spending downloads
+    if cfg.thresholds.exclude_non_common:
+        excluded = [t for t in tickers if is_excluded_instrument(t)]
+        tickers = [t for t in tickers if not is_excluded_instrument(t)]
+        for sym in excluded:
+            rows.append({"symbol": sym, "tradable": False,
+                         "reject_reasons": "excluded_instrument"})
+        if excluded:
+            print(f"Excluded {len(excluded)} non-common instruments "
+                  f"(units/warrants/prefs); {len(tickers)} remain")
+
     # FIX #5: fetch benchmark once upfront
     print(f"Fetching benchmark {cfg.benchmark} ...")
     bench_close = fetch_benchmark(
@@ -360,7 +427,6 @@ def run_universe_builder(cfg: UniverseBuilderConfig) -> Tuple[pd.DataFrame, pd.D
     if not bench_close.empty:
         print(f"  Benchmark OK — {len(bench_close)} bars")
 
-    rows: List[Dict] = []
     batches = chunked(tickers, cfg.batch_size)
 
     for i, batch in enumerate(batches, 1):
@@ -371,10 +437,21 @@ def run_universe_builder(cfg: UniverseBuilderConfig) -> Tuple[pd.DataFrame, pd.D
             )
         except Exception as e:
             print(f"  Batch fetch error: {e}")
+            # every ticker must land in tradable or rejected — a failed batch
+            # must not silently vanish from the diagnostics CSV
+            for sym in batch:
+                rows.append({"symbol": sym, "error": "batch_fetch_failed",
+                             "tradable": False,
+                             "reject_reasons": "batch_fetch_failed"})
             time.sleep(cfg.sleep_seconds)
             continue
 
-        if isinstance(big.columns, pd.MultiIndex):
+        if big.empty:
+            for sym in batch:
+                rows.append({"symbol": sym, "error": "no_data",
+                             "tradable": False, "reject_reasons": "no_data"})
+
+        elif isinstance(big.columns, pd.MultiIndex):
             for sym in batch:
                 if sym not in big.columns.get_level_values(0):
                     rows.append({"symbol": sym, "error": "no_data",
@@ -388,6 +465,17 @@ def run_universe_builder(cfg: UniverseBuilderConfig) -> Tuple[pd.DataFrame, pd.D
                 # FIX #1: normalize index timezone for alignment with benchmark
                 sub.index = pd.to_datetime(sub.index).tz_localize(None)
                 _process_symbol(sym, sub, bench_close, cfg, rows)
+
+        elif len(batch) > 1:
+            # Flat columns for a multi-ticker request: yfinance returns this
+            # when only one ticker in the batch resolved, but the columns
+            # carry no ticker label — attributing them to batch[0] would
+            # assign one ticker's prices to another. Reject the whole batch
+            # rather than guess.
+            for sym in batch:
+                rows.append({"symbol": sym, "error": "ambiguous_flat_data",
+                             "tradable": False,
+                             "reject_reasons": "ambiguous_flat_data"})
 
         else:
             # Single-ticker path
@@ -443,8 +531,11 @@ def run_universe_builder(cfg: UniverseBuilderConfig) -> Tuple[pd.DataFrame, pd.D
     out_one_line = f"{cfg.out_one_line_file_path}"
     out_rejected = f"{cfg.out_rejected_file_path}"
 
+    # create parent dirs for ALL outputs, not just the universe file
+    for p in (out_txt, out_one_line, out_rejected):
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+
     out_file = Path(out_txt)  # no extension, ok
-    out_file.parent.mkdir(parents=True, exist_ok=True)
     with out_file.open("w", encoding="utf-8") as f:
         for sym in df_tradable["symbol"].tolist():
             f.write(sym + "\n")
@@ -551,11 +642,13 @@ if __name__ == "__main__":
         thresholds=Thresholds(
             min_price=1.0,
             min_avg_dollar_vol_20=1_000_000.0,
+            min_atr_pct_14=0.015,
             max_atr_pct_14=0.05,
             max_one_day_drop_126=-0.15,
             require_above_50d=True,
             prefer_above_200d=True,
             max_stale_days=5,
+            exclude_non_common=True,
         ),
     )
 
