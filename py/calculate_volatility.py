@@ -110,4 +110,4 @@ def main():
 
 if __name__ == "__main__":
     # main()
-    calculate_squeeze_and_atr("VIVK", True)
+    calculate_squeeze_and_atr("RTX", True)
