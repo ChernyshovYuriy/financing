@@ -1,0 +1,25 @@
+/etc/systemd/system/
+
+sudo cp /home/yurii/dev/financing/system/financing-swing-universe.service /etc/systemd/system/
+sudo cp /home/yurii/dev/financing/system/financing-swing-universe.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now financing-swing-universe.timer
+
+systemctl list-timers --all | grep financing
+
+# one-off manual run (also useful for a first smoke test before relying on the timer)
+sudo systemctl start financing-swing-universe.service
+
+journalctl -u financing-swing-universe.service -n 100 --no-pager
+
+# Notes
+# - Runs Fri 18:00 America/Toronto (system tz), a couple hours after TSX/US close,
+#   buffering for any yfinance daily-bar publish lag.
+# - Persistent=true (unlike stockscanner's timers): this is a weekly job, so if the
+#   box is off at 18:00 Friday, systemd fires it on next boot instead of losing a
+#   full week's freshness.
+# - system/run_swing_universe.sh runs py/swing_universe.py with its default paths
+#   (must run from py/, writes ../data/can_tickers_swing_universe), then git add +
+#   commit + push origin main iff data/can_tickers_swing_universe actually changed.
+# - Requires: git push over SSH must work non-interactively as user yurii
+#   (id_ed25519 has no passphrase, verified working via `ssh -T git@github.com`).

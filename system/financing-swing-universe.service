@@ -1,0 +1,16 @@
+[Unit]
+Description=Financing swing universe builder + git publish
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=yurii
+WorkingDirectory=/home/yurii/dev/financing
+ExecStart=/home/yurii/dev/financing/system/run_swing_universe.sh
+Nice=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

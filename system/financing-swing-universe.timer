@@ -1,0 +1,10 @@
+[Unit]
+Description=Run financing swing universe builder Fridays at 18:00 local time (after TSX/US close)
+
+[Timer]
+OnCalendar=Fri 18:00
+Persistent=true
+Unit=financing-swing-universe.service
+
+[Install]
+WantedBy=timers.target
