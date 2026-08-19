@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-REPO_DIR="/home/yurii/dev/financing"
+REPO_DIR="/home/pi/dev/financing"
 PY="$REPO_DIR/.venv/bin/python3"
 OUT_FILE="data/can_tickers_swing_universe"
 

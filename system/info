@@ -1,7 +1,7 @@
 /etc/systemd/system/
 
-sudo cp /home/yurii/dev/financing/system/financing-swing-universe.service /etc/systemd/system/
-sudo cp /home/yurii/dev/financing/system/financing-swing-universe.timer /etc/systemd/system/
+sudo cp /home/pi/dev/financing/system/financing-swing-universe.service /etc/systemd/system/
+sudo cp /home/pi/dev/financing/system/financing-swing-universe.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now financing-swing-universe.timer
 
@@ -21,5 +21,7 @@ journalctl -u financing-swing-universe.service -n 100 --no-pager
 # - system/run_swing_universe.sh runs py/swing_universe.py with its default paths
 #   (must run from py/, writes ../data/can_tickers_swing_universe), then git add +
 #   commit + push origin main iff data/can_tickers_swing_universe actually changed.
-# - Requires: git push over SSH must work non-interactively as user yurii
-#   (id_ed25519 has no passphrase, verified working via `ssh -T git@github.com`).
+# - Requires: git push over SSH must work non-interactively as user pi
+#   on the target host (verify with `sudo -u pi ssh -T git@github.com`;
+#   the key used must have no passphrase, or an agent must be reachable
+#   from the systemd service, which it normally isn't).
