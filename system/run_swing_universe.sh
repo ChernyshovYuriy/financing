@@ -7,7 +7,9 @@
 set -euo pipefail
 
 REPO_DIR="/home/pi/dev/financing"
-PY="$REPO_DIR/.venv/bin/python3"
+# No venv on this box, same as stockscanner's units: rely on the system
+# python3 having yfinance/pandas/numpy installed globally.
+PY="python3"
 OUT_FILE="data/can_tickers_swing_universe"
 
 cd "$REPO_DIR/py"
