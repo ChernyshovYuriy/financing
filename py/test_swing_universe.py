@@ -874,6 +874,15 @@ def test_pass_each_reject_reason_independent():
     "GHI-DB.TO",   # debenture
     "RY-PA.TO",    # preferred series
     "ENB-PC.TO",
+    # FIX #17: lettered multi-series variants — real tickers from
+    # data/can_tickers_full that leaked through as "common" pre-fix.
+    "AD-DBB.TO",   # convertible debenture, series B
+    "FC-DBM.TO",   # convertible debenture, series M
+    "GPH-WTA.V",   # warrant, series A
+    "IAU-WTU.TO",  # warrant, series U
+    "TD-PFA.TO",   # rate-reset preferred, Series F sub-series A
+    "BN-PFM.TO",   # preferred, Series F sub-series M
+    "ENB-PFV.TO",  # preferred, Series F sub-series V
 ])
 def test_excluded_instrument_true(symbol):
     assert is_excluded_instrument(symbol) is True
@@ -908,6 +917,27 @@ def test_excluded_instrument_single_letter_class_p_kept():
     assert is_excluded_instrument("X-P.TO") is False
 
 
+def test_excluded_instrument_preferred_series_letter_beyond_two_kept():
+    """FIX #17 boundary: -P plus 1-2 letters (series A..Z, series F-A..F-V)
+    is excluded; a 3-letter tail after -P is outside the known convention
+    and is kept rather than guessed at."""
+    assert is_excluded_instrument("X-PFAX.TO") is False
+
+
+@pytest.mark.parametrize("symbol", [
+    "AGMR-WTB.TO", "RECO-WTB.V", "RECO-WTC.V", "STCK-WTB.TO", "STCK-WTC.TO",
+    "ODV-WTV.V", "MAK-WTU.TO",              # warrants, more series letters
+    "AD-DBC.TO", "AFN-DBK.TO", "DIV-DBB.TO", "FSZ-DBC.TO", "PBH-DBK.TO",
+    "SVI-DBD.TO", "VITL-DBH.TO", "VITL-DBI.TO",  # debentures, more series letters
+    "PPL-PFA.TO", "PPL-PFE.TO", "PWF-PFA.TO",
+    "TD-PFI.TO", "TD-PFJ.TO",               # preferreds, more Series-F letters
+])
+def test_excluded_instrument_true_lettered_series_regression(symbol):
+    """FIX #17 regression set: real tickers pulled from
+    data/can_tickers_full that were confirmed leaking through pre-fix."""
+    assert is_excluded_instrument(symbol) is True
+
+
 # ─── score_row ───────────────────────────────────────────────────────────────
 
 
@@ -940,6 +970,26 @@ def test_score_above_50d_adds_1():
 
 def test_score_above_200d_adds_2():
     assert score_row({"above_200d": True}) - score_row({}) == pytest.approx(2.0)
+
+
+def test_score_above_200d_default_matches_prefer_true():
+    """Default prefer_above_200d=True preserves pre-FIX#18 behavior."""
+    row = {"above_200d": True}
+    assert score_row(row) == score_row(row, prefer_above_200d=True)
+
+
+def test_score_above_200d_bonus_disabled_when_not_preferred():
+    """FIX #18: prefer_above_200d=False must actually suppress the bonus —
+    previously Thresholds.prefer_above_200d was read nowhere and the +2.0
+    applied unconditionally regardless of the flag."""
+    row = {"above_200d": True}
+    assert score_row(row, prefer_above_200d=False) == pytest.approx(0.0)
+    assert score_row(row, prefer_above_200d=False) != score_row(row, prefer_above_200d=True)
+
+
+def test_score_above_200d_false_unaffected_by_prefer_flag():
+    row = {"above_200d": False}
+    assert score_row(row, prefer_above_200d=False) == score_row(row, prefer_above_200d=True)
 
 
 def test_score_negative_slope_no_contribution():
@@ -1584,6 +1634,27 @@ def test_process_symbol_passing_ticker():
     assert r["tradable"] is True
     assert r["reject_reasons"] == ""
     assert not math.isnan(r["score"])
+
+
+def test_process_symbol_honors_prefer_above_200d_false():
+    """FIX #18: cfg.thresholds.prefer_above_200d must reach score_row via
+    _process_symbol — a passing, above-200d ticker scores 2.0 pts lower with
+    the flag off than with it on (all else equal)."""
+    df = _ohlcv(n=252)
+    bench = _bench()
+
+    rows_on = []
+    cfg_on = UniverseBuilderConfig(thresholds=Thresholds(prefer_above_200d=True))
+    _process_symbol("RY.TO", df, bench, cfg_on, rows_on)
+
+    rows_off = []
+    cfg_off = UniverseBuilderConfig(thresholds=Thresholds(prefer_above_200d=False))
+    _process_symbol("RY.TO", df, bench, cfg_off, rows_off)
+
+    r_on, r_off = rows_on[0], rows_off[0]
+    assert r_on["tradable"] is True and r_off["tradable"] is True
+    assert r_on["above_200d"] is True  # sanity: the fixture is above its 200d SMA
+    assert r_on["score"] - r_off["score"] == pytest.approx(2.0)
 
 
 def test_process_symbol_short_history_rejected_atr_unavailable():

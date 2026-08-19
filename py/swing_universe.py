@@ -28,6 +28,12 @@ Fixes applied vs original:
   #16 RS skipped when the benchmark's last common bar lags the stock by more
       than 3 bars (stale benchmark would shift the RS endpoint into the past);
       RS exception handling narrowed to alignment errors
+  #17 is_excluded_instrument() now matches lettered multi-series suffixes
+      (debentures -DBB../-DBM.., warrants -WTA../-WTV.., "Series F" preferreds
+      -PFA../-PFV..) — 44 live tickers in data/can_tickers_full were leaking
+      through as common shares under the old single-letter/plain-suffix match
+  #18 prefer_above_200d actually gates the above-200d scoring bonus now;
+      previously the config flag was read nowhere and the bonus always applied
 
 Run from IDE:
     from swing_universe import UniverseBuilderConfig, run_universe_builder
@@ -263,14 +269,22 @@ def analyze_symbol(df: pd.DataFrame,
 # FIX #14: Yahoo suffix patterns for instruments that structurally don't trend
 # like common shares: trust/REIT units, USD-denominated listings, warrants,
 # rights, debentures, preferred series. Share classes (-A, -B, ...) are kept.
-_NON_COMMON_SUFFIXES = ("-UN", "-U", "-WT", "-RT", "-DB")
-_PREFERRED_RE = re.compile(r"-P[A-Z]$")
+#
+# FIX #17: multi-series instruments carry a trailing series letter that the
+# original plain endswith()/single-letter regex missed — e.g. debentures
+# AD-DBB.TO / FC-DBM.TO, warrants GPH-WTA.V / IAU-WTU.TO, and "Series F"
+# preferreds TD-PFA.TO / BN-PFA.TO / ENB-PFA.TO. Confirmed against
+# data/can_tickers_full: 44 live tickers were leaking through as "common"
+# before this fix. -UN/-U/-RT have no observed lettered variants today but
+# get the same optional-letter treatment for symmetry/future-proofing.
+_NON_COMMON_RE = re.compile(r"-(UN|U|WT|RT|DB)[A-Z]?$")
+_PREFERRED_RE = re.compile(r"-P[A-Z]{1,2}$")  # -PA (series A) or -PFA (series F-A)
 
 
 def is_excluded_instrument(symbol: str) -> bool:
-    """True if the symbol looks like a non-common-share instrument (FIX #14)."""
+    """True if the symbol looks like a non-common-share instrument (FIX #14/#17)."""
     root = symbol.split(".")[0]
-    if any(root.endswith(sfx) for sfx in _NON_COMMON_SUFFIXES):
+    if _NON_COMMON_RE.search(root):
         return True
     return bool(_PREFERRED_RE.search(root))
 
@@ -335,7 +349,7 @@ def atr_band_bonus(atr_pct: float,
     return peak * (ramp_hi - atr_pct) / (ramp_hi - sweet_hi)
 
 
-def score_row(row: Dict) -> float:
+def score_row(row: Dict, prefer_above_200d: bool = True) -> float:
     """
     Higher is better. All fixes applied:
       - FIX #2:  above_200d weight raised to +2.0 (was +0.8, drowned by liquidity)
@@ -345,6 +359,12 @@ def score_row(row: Dict) -> float:
       - FIX #12: ATR rewarded in a 2.5-3.5% sweet-spot band, not penalized
       - FIX #13: worst-day dropped from scoring (hard filter only) — it
                  double-counted volatility on top of ATR
+      - FIX #18: prefer_above_200d now actually gates the +2.0 bonus below —
+                 previously Thresholds.prefer_above_200d was read nowhere and
+                 the bonus applied unconditionally regardless of its value.
+
+    prefer_above_200d: when False, the above-200d bonus is not applied (the
+    soft-gate is disabled entirely rather than just documented as one).
     """
     score = 0.0
 
@@ -359,7 +379,8 @@ def score_row(row: Dict) -> float:
         score += 1.0
 
     # FIX #2: meaningful weight for 200d — was +0.8, easily drowned by liquidity
-    if row.get("above_200d", False):
+    # FIX #18: now actually gated by prefer_above_200d (see docstring above)
+    if prefer_above_200d and row.get("above_200d", False):
         score += 2.0
 
     # ── Slope quality (FIX #7: normalized, now comparable) ──────────────────
@@ -621,7 +642,10 @@ def _process_symbol(sym: str, sub: pd.DataFrame,
     ok, reasons = pass_filters(metrics, cfg.thresholds)
     metrics["tradable"] = ok
     metrics["reject_reasons"] = ",".join(reasons) if reasons else ""
-    metrics["score"] = score_row(metrics) if ok else float("nan")
+    metrics["score"] = (
+        score_row(metrics, prefer_above_200d=cfg.thresholds.prefer_above_200d)
+        if ok else float("nan")
+    )
     rows.append(metrics)
 
 
