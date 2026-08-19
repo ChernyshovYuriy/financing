@@ -19,7 +19,8 @@ cd "$REPO_DIR"
 
 if [ -n "$(git status --porcelain -- "$OUT_FILE")" ]; then
     git add "$OUT_FILE"
-    git commit -m "Update swing universe ($(date -u +%Y-%m-%d))"
+    git -c user.name="Financing Bot" -c user.email="chernyshov.yuriy@gmail.com" \
+        commit -m "Update swing universe ($(date -u +%Y-%m-%d))"
     git push origin main
     echo "Pushed updated $OUT_FILE"
 else
