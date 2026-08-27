@@ -34,6 +34,12 @@ Fixes applied vs original:
       through as common shares under the old single-letter/plain-suffix match
   #18 prefer_above_200d actually gates the above-200d scoring bonus now;
       previously the config flag was read nowhere and the bonus always applied
+  #19 analyze_symbol now defensively sorts its input by index before use —
+      previously an out-of-order DataFrame (reachable via the single-ticker
+      batch fallback path; multi-ticker MultiIndex batches share one common
+      sorted index so were not exposed) made .iloc[-1] silently read the
+      OLDEST bar as "last_close" and computed a nonsense days_stale, with no
+      error raised
 
 Run from IDE:
     from swing_universe import UniverseBuilderConfig, run_universe_builder
@@ -168,6 +174,15 @@ def analyze_symbol(df: pd.DataFrame,
     bench_close: aligned benchmark Close series (optional, for RS calc).
     """
     out: Dict = {}
+
+    # FIX #19: every downstream calc treats the last row as "today" via
+    # .iloc[-1]/.rolling() — if the index ever arrives out of order (a lone
+    # ticker's single-ticker batch is not realigned the way multi-ticker
+    # MultiIndex batches are), that silently reads the WRONG bar as current
+    # with no error. Enforce ascending order defensively rather than trust
+    # the caller.
+    if not df.index.is_monotonic_increasing:
+        df = df.sort_index()
 
     # FIX #8: guard against all-NaN columns from single-ticker batch
     needed = {"Open", "High", "Low", "Close", "Volume"}
